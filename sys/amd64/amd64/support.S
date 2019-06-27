@@ -61,16 +61,40 @@ ENTRY(bzero)
 	ret
 END(bzero)
 
-/* Address: %rdi */
+/* pagezero_erms ported from FreeBSD 12 */
 ENTRY(pagezero)
 	PUSH_FRAME_POINTER
-	movq	$PAGE_SIZE/8,%rcx
+	movq	$PAGE_SIZE,%rcx
 	xorl	%eax,%eax
 	rep
-	stosq
+	stosb
 	POP_FRAME_POINTER
 	ret
 END(pagezero)
+
+/* Address: %rdi */
+ENTRY(sse2_pagezero)
+        PUSH_FRAME_POINTER
+        movq    $-PAGE_SIZE,%rdx
+        subq    %rdx,%rdi
+        xorl    %eax,%eax
+        jmp     1f
+        /*
+         * The loop takes 29 bytes.  Ensure that it doesn`t cross a 32-byte
+         * cache line.
+         */
+        .p2align 5,0x90
+1:
+        movnti  %rax,(%rdi,%rdx)
+        movnti  %rax,8(%rdi,%rdx)
+        movnti  %rax,16(%rdi,%rdx)
+        movnti  %rax,24(%rdi,%rdx)
+        addq    $32,%rdx
+        jne     1b
+        sfence
+        POP_FRAME_POINTER
+        ret
+END(sse2_pagezero)
 
 ENTRY(bcmp)
 	PUSH_FRAME_POINTER
