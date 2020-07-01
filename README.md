@@ -20,7 +20,7 @@ Details are in our ATC paper:
 
 ## Quicksilver Kernel Build
 
-Install FreeBSD kernel image first: FreeBSD-11.2-RELEASE-amd64-memstick.img. Then, clone Quicksilver source code to /usr/src. Use the following command to build and install the kernel:
+Install FreeBSD kernel image first: [FreeBSD-11.2-RELEASE-amd64-memstick.img](https://download.freebsd.org/ftp/releases/ISO-IMAGES/11.2/FreeBSD-11.2-RELEASE-amd64-memstick.img). Then, clone Quicksilver source code to /usr/src. Use the following command to build and install the kernel:
 
     $make buildkernel -j9
     $make installkernel -j9
