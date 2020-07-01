@@ -13,10 +13,10 @@ Details are in our ATC paper:
 
 ## Components
 
-Quicksilver.diff: The patch of quicksilver starting from FreeBSD release 11.2
-Config: System tuning scripts for Quicksilver variants (Sync-1, Sync-64, Async-64, Async-256)
-Benchmark: benchmarks used in our ATC paper
-Frag: Micro fragmentation benchmark to replicate our memory fragmentation (Frag-50 and Frag-100)
+- Quicksilver.diff: The patch of quicksilver starting from FreeBSD release 11.2
+- Config: System tuning scripts for Quicksilver variants (Sync-1, Sync-64, Async-64, Async-256)
+- Benchmark: benchmarks used in our ATC paper
+- Frag: Micro fragmentation benchmark to replicate our memory fragmentation (Frag-50 and Frag-100)
 
 ## Quicksilver Kernel Build
 
