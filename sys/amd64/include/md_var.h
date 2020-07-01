@@ -68,6 +68,8 @@ void	fsbase_load_fault(void) __asm(__STRING(fsbase_load_fault));
 void	gsbase_load_fault(void) __asm(__STRING(gsbase_load_fault));
 void	fpstate_drop(struct thread *td);
 void	pagezero(void *addr);
+void	sse2_pagezero(void *addr);
+void	sse2_pagezero_chunk(void *addr, int pagesize);
 void	setidt(int idx, alias_for_inthand_t *func, int typ, int dpl, int ist);
 struct savefpu *get_pcb_user_save_td(struct thread *td);
 struct savefpu *get_pcb_user_save_pcb(struct pcb *pcb);

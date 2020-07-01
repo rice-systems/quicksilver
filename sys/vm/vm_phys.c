@@ -396,6 +396,29 @@ sysctl_vm_phys_free(SYSCTL_HANDLER_ARGS)
 	return (error);
 }
 
+
+
+/*
+ * Return the number of available reservation allocations
+ */
+int
+vm_phys_count_order_9(void)
+{
+	struct vm_freelist *fl;
+	int dom, flind, oind, pind;
+	int count = 0;
+
+	for (dom = 0; dom < vm_ndomains; dom++)
+		for (flind = 0; flind < vm_nfreelists; flind++)
+			for (oind = VM_NFREEORDER - 1; oind >= 9; oind--)
+				for (pind = 0; pind < VM_NFREEPOOL; pind++)
+				{
+					fl = vm_phys_free_queues[dom][flind][pind];
+					count += fl[oind].lcnt << (oind - 9);
+				}
+	return count;
+}
+
 /*
  * Outputs the set of physical memory segments.
  */
@@ -1483,3 +1506,85 @@ DB_SHOW_COMMAND(freepages, db_show_freepages)
 	}
 }
 #endif
+
+
+static void
+vm_phys_prezero_all(void)
+{
+	vm_page_t m, m_tmp, m_first;
+	int order, zeroed;
+
+	mtx_lock(&vm_page_queue_free_mtx);
+
+	for(order = VM_NFREEORDER - 1; order >= 9; order --)
+	{
+		zeroed = 0;
+		m_first = NULL;
+		for(;;)
+		{
+			m = vm_phys_alloc_pages(VM_FREEPOOL_DEFAULT, order);
+
+			/* no resource or finishes scanning */
+			if(m == NULL || m == m_first)
+			{
+				if(m != NULL)
+					vm_phys_free_pages(m, order);
+				break;
+			}
+
+			if(m_first == NULL)
+				m_first = m;
+
+			/* the freelist queue of order has been fully scanned */
+			// if((m->flags & PG_ZERO) != 0)
+			// {
+			// 	vm_phys_free_pages(m, order);
+			// 	break;
+			// }
+
+
+			for (m_tmp = m; m_tmp < &m[1 << order]; m_tmp++)
+			{
+				if ((m_tmp->flags & PG_ZERO) == 0)
+				{
+					pmap_zero_page_idle(m_tmp);
+					m_tmp->flags |= PG_ZERO;
+					vm_page_zero_count++;
+					cnt_prezero++;
+				}
+				else
+				{
+					/* It is fine, skip and do nothing */
+					// panic("zero pages in contiguous pre-zero");
+				}
+			}
+
+			zeroed ++;
+			vm_phys_free_pages(m, order);
+		}
+
+		printf("Zeroed %d order-%d pages\n", zeroed, order);
+	}
+
+	mtx_unlock(&vm_page_queue_free_mtx);
+}
+
+/*
+ * Allow userspace to directly trigger prezero
+ */
+static int
+debug_vm_prezero_all(SYSCTL_HANDLER_ARGS)
+{
+	int error, i;
+
+	i = 0;
+	error = sysctl_handle_int(oidp, &i, 0, req);
+	if (error)
+		return (error);
+	if (i != 0)
+		vm_phys_prezero_all();
+	return (0);
+}
+
+SYSCTL_PROC(_vm, OID_AUTO, prezero_all, CTLTYPE_INT | CTLFLAG_RW, 0, 0,
+    debug_vm_prezero_all, "I", "set to prezero all chunks le 2MB");

@@ -66,6 +66,17 @@ vm_paddr_t	vm_reserv_startup(vm_offset_t *vaddr, vm_paddr_t end,
 		    vm_paddr_t high_water);
 vm_page_t	vm_reserv_to_superpage(vm_page_t m);
 
+/* [syncpromo] */
+bool 		vm_reserv_satisfy_sync_promotion(vm_page_t m);
+bool 		vm_reserv_satisfy_adj_promotion(vm_page_t m);
+vm_pindex_t	vm_reserv_pindex_from_page(vm_page_t m);
+void		vm_reserv_copy_popmap_from_page(vm_page_t m, u_long*);
+int 		vm_reserv_popmap_is_clear(vm_page_t m, int i);
+void		vm_reserv_mark_bad(vm_page_t m);
+bool 		vm_reserv_is_full(vm_page_t m);
+int 		vm_reserv_get_next_set_index(vm_page_t m, int i);
+int 		vm_reserv_get_next_clear_index(vm_page_t m, int i);
+
 #endif	/* VM_NRESERVLEVEL > 0 */
 #endif	/* _KERNEL */
 #endif	/* !_VM_RESERV_H_ */

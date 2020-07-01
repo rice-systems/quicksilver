@@ -353,8 +353,42 @@ vm_radix_insert(struct vm_radix *rtree, vm_page_t page)
 		if (vm_radix_isleaf(rnode)) {
 			m = vm_radix_topage(rnode);
 			if (m->pindex == index)
+			{
+#ifdef DEBUG_ASYNCPROMO
+				printf("last request is :%x\n", last_request);
+				printf("popcnt of m: %d\n", vm_reserv_get_popcnt_from_page(m));
+				printf("[panic] same page:%d <rtree,insert>: valid:<%d,%d> busy:<%d,%d> object:<%p,%p>\n",
+					m == page,
+					m->valid, page->valid,
+					vm_page_xbusied(m), vm_page_xbusied(page),
+					m->object, page->object
+					);
+				// printf("[panic] vm_page_t <%p:%p:%p>, pindex:<%lu,%lu>, popcnt:%d, popmap:%d\n",
+				// 	m, page, vm_reserv_get_page(rv_to_prepopulate, rv_popidx_to_prepopulate),
+				// 	m->pindex, page->pindex,
+				// 	vm_reserv_get_popcnt(rv_to_prepopulate),
+				// 	vm_reserv_get_popind(rv_to_prepopulate, rv_popidx_to_prepopulate)
+				// 	);
+				// printf("[panic] paddr <%lx:%lx:%lx>\n",
+				// 	m->phys_addr,
+				// 	page->phys_addr,
+				// 	vm_reserv_get_page(rv_to_prepopulate, rv_popidx_to_prepopulate)->phys_addr
+				// 	);
+				// printf("[panic] rv: object[%p] rv[%p] rv->pindex[%lu]\n",
+				// 	vm_reserv_get_object(rv_to_prepopulate),
+				// 	rv_to_prepopulate,
+				// 	vm_reserv_get_pindex(rv_to_prepopulate));
+
+				// printf("[panic] pindex from m\n");
+				// vm_reserv_show_all_pindex_from_page(m);
+				// printf("[panic] pindex from rv_to_prepopulate\n");
+				// vm_reserv_show_all_pindex_from_page(vm_reserv_get_page(rv_to_prepopulate, rv_popidx_to_prepopulate));
+				// printf("[panic] rv is deadbeef? %d\n", vm_reserv_is_deadbeef(rv_to_prepopulate));
+				// KASSERT(m->pindex != index, "pindex already exists in radix tree\n");
+#endif
 				panic("%s: key %jx is already present",
 				    __func__, (uintmax_t)index);
+			}
 			clev = vm_radix_keydiff(m->pindex, index);
 			tmp = vm_radix_node_get(vm_radix_trimkey(index,
 			    clev + 1), 2, clev);

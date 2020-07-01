@@ -126,6 +126,9 @@ __FBSDID("$FreeBSD$");
  *	page structure.
  */
 
+#ifdef DEBUG_ASYNCPROMO
+int last_request;
+#endif
 struct vm_domain vm_dom[MAXMEMDOM];
 struct mtx_padalign __exclusive_cache_line vm_page_queue_free_mtx;
 
@@ -144,6 +147,10 @@ SYSCTL_INT(_vm, OID_AUTO, boot_pages, CTLFLAG_RDTUN | CTLFLAG_NOFETCH,
 static int pa_tryrelock_restart;
 SYSCTL_INT(_vm, OID_AUTO, tryrelock_restart, CTLFLAG_RD,
     &pa_tryrelock_restart, 0, "Number of tryrelock restarts");
+
+static int relax = 0;
+SYSCTL_INT(_vm, OID_AUTO, relax, CTLFLAG_RWTUN,
+    &relax, 0, "relax vm_page_ps_test");
 
 static TAILQ_HEAD(, vm_page) blacklist_head;
 static int sysctl_vm_page_blacklist(SYSCTL_HANDLER_ARGS);
@@ -165,8 +172,8 @@ static int vm_page_insert_after(vm_page_t m, vm_object_t object,
     vm_pindex_t pindex, vm_page_t mpred);
 static void vm_page_insert_radixdone(vm_page_t m, vm_object_t object,
     vm_page_t mpred);
-static int vm_page_reclaim_run(int req_class, u_long npages, vm_page_t m_run,
-    vm_paddr_t high);
+// static int vm_page_reclaim_run(int req_class, u_long npages, vm_page_t m_run,
+//     vm_paddr_t high);
 static int vm_page_alloc_fail(vm_object_t object, int req);
 
 SYSINIT(vm_page, SI_SUB_VM, SI_ORDER_SECOND, vm_page_init_fakepg, NULL);
@@ -1422,6 +1429,25 @@ vm_page_find_least(vm_object_t object, vm_pindex_t pindex)
 }
 
 /*
+ *	vm_page_find_most:
+ *
+ *	Returns the page associated with the object with biggest pindex
+ *	less than or equal to the parameter pindex, or NULL.
+ *
+ *	The object must be locked.
+ */
+vm_page_t
+vm_page_find_most(vm_object_t object, vm_pindex_t pindex)
+{
+	vm_page_t m;
+
+	VM_OBJECT_ASSERT_LOCKED(object);
+	if ((m = TAILQ_LAST(&object->memq, pglist)) != NULL && m->pindex > pindex)
+		m = vm_radix_lookup_le(&object->rtree, pindex);
+	return (m);
+}
+
+/*
  * Returns the given page's successor (by pindex) within the object if it is
  * resident; if none is found, NULL is returned.
  *
@@ -1651,25 +1677,55 @@ again:
 		/*
 		 * Can we allocate the page from a reservation?
 		 */
+
 #if VM_NRESERVLEVEL > 0
 		if (object == NULL || (object->flags & (OBJ_COLORED |
 		    OBJ_FICTITIOUS)) != OBJ_COLORED || (m =
-		    vm_reserv_alloc_page(object, pindex, mpred)) == NULL)
-#endif
-		{
+		    vm_reserv_alloc_page(object, pindex, mpred)) == NULL
+		    )
+
 			/*
-			 * If not, allocate it from the free page queues.
+			 * [asyncpromo]
+			 * Must we alloc the page from a reservation?
+			 * check if req & VM_ALLOC_RESERVONLY == 0
+			 * define a else which unlocks the freequeue lock and return
 			 */
-			m = vm_phys_alloc_pages(object != NULL ?
-			    VM_FREEPOOL_DEFAULT : VM_FREEPOOL_DIRECT, 0);
-#if VM_NRESERVLEVEL > 0
-			if (m == NULL && vm_reserv_reclaim_inactive()) {
-				m = vm_phys_alloc_pages(object != NULL ?
-				    VM_FREEPOOL_DEFAULT : VM_FREEPOOL_DIRECT,
-				    0);
-			}
+		{
+		    if((req & VM_ALLOC_RESERVONLY) == 0)
 #endif
+			{
+				/*
+				 * If not, allocate it from the free page queues.
+				 */
+				m = vm_phys_alloc_pages(object != NULL ?
+				    VM_FREEPOOL_DEFAULT : VM_FREEPOOL_DIRECT, 0);
+#if VM_NRESERVLEVEL > 0
+				if (m == NULL && vm_reserv_reclaim_inactive()) {
+					m = vm_phys_alloc_pages(object != NULL ?
+					    VM_FREEPOOL_DEFAULT : VM_FREEPOOL_DIRECT,
+					    0);
+				}
+#endif
+			}
+
+#if VM_NRESERVLEVEL > 0
+			/*
+			 * [asyncpromo]
+			 * Seems that asyncpromo is trying to alloc a page
+			 * from a broken reservation
+			 *
+			 * unlock the free page queue lock
+			 * (like vm_page alloc_fail) and return NULL
+			 * Tell asyncpromo to avoid unnecessary forward effort
+			 * to zero the remaining pages
+			 */
+			else {
+				mtx_unlock(&vm_page_queue_free_mtx);
+				return (NULL);
+			}
 		}
+#endif
+
 	} else {
 		/*
 		 * Not allocatable, give up.
@@ -1718,6 +1774,9 @@ again:
 	m->act_count = 0;
 
 	if (object != NULL) {
+#ifdef DEBUG_ASYNCPROMO
+		last_request = req;
+#endif
 		if (vm_page_insert_after(m, object, pindex, mpred)) {
 			pagedaemon_wakeup();
 			if (req & VM_ALLOC_WIRED) {
@@ -1855,10 +1914,42 @@ retry:
 		    low, high, alignment, boundary, mpred)) == NULL)
 #endif
 			/*
-			 * If not, allocate them from the free page queues.
+			 * [syncpromo]
+			 * Must we alloc the pages from a reservation?
+			 * check if req & VM_ALLOC_RESERVONLY == 0
+			 * abort if we must allocate from a reservation
 			 */
-			m_ret = vm_phys_alloc_contig(npages, low, high,
-			    alignment, boundary);
+		{
+
+#if VM_NRESERVLEVEL > 0
+		    if((req & VM_ALLOC_RESERVONLY) == 0)
+#endif
+				/*
+				 * If not, allocate them from the free page queues.
+				 */
+				m_ret = vm_phys_alloc_contig(npages, low, high,
+				    alignment, boundary);
+
+#if VM_NRESERVLEVEL > 0
+			else
+			{
+				/*
+				 * [syncpromo]
+				 * Seems that asyncpromo is trying to alloc a page
+				 * from a broken reservation
+				 *
+				 * unlock the free page queue lock
+				 * (like vm_page alloc_fail) and return NULL
+				 * Tell asyncpromo to avoid unnecessary forward effort
+				 * to zero the remaining pages
+				 *
+				 * Do not squeeze the vm_phys_alloc_contig but fail
+				 */
+				mtx_unlock(&vm_page_queue_free_mtx);
+				return (NULL);
+			}
+		}
+#endif
 	} else {
 		if (vm_page_alloc_fail(object, req))
 			goto again;
@@ -2270,7 +2361,7 @@ unlock:
  *
  *	"req_class" must be an allocation class.
  */
-static int
+int
 vm_page_reclaim_run(int req_class, u_long npages, vm_page_t m_run,
     vm_paddr_t high)
 {
@@ -2807,6 +2898,71 @@ vm_page_activate(vm_page_t m)
 		if (m->act_count < ACT_INIT)
 			m->act_count = ACT_INIT;
 	}
+}
+
+/*
+ * activate 512 pages for a superpage
+ * the m_super page lock is held (a hack for current page lock implementation)
+ * skip m_skip which will be activated later by vm_fault_hold
+ * prefaulted pages are not wired.
+ */
+void
+vm_page_activate_super(vm_page_t m_super, vm_page_t m_skip)
+{
+	struct vm_pagequeue *pq;
+	vm_page_t m_tmp;
+
+	vm_page_lock_assert(m_super, MA_OWNED);
+
+	/* all superpage belongs to the same vm_domain */
+	pq = &vm_phys_domain(m_super)->vmd_pagequeues[PQ_ACTIVE];
+	vm_pagequeue_lock(pq);
+	for(m_tmp = m_super; m_tmp < &m_super[512]; m_tmp++)
+	{
+		/* most pages are not faulted so simply scan over all pages */
+		if(m_tmp->queue == PQ_NONE && m_tmp->valid == VM_PAGE_BITS_ALL && m_tmp != m_skip)
+		{
+			if (m_tmp->act_count < ACT_INIT)
+				m_tmp->act_count = ACT_INIT;
+			// vm_page_enqueue(PQ_ACTIVE, m_tmp);
+			m_tmp->queue = PQ_ACTIVE;
+			TAILQ_INSERT_TAIL(&pq->pq_pl, m_tmp, plinks.q);
+			vm_pagequeue_cnt_inc(pq);
+		}
+	}
+	vm_pagequeue_unlock(pq);
+}
+
+
+/*
+ * activate pages in a range
+ */
+void
+vm_page_activate_and_validate_pages(vm_page_t m_left, int npages)
+{
+	struct vm_pagequeue *pq;
+	vm_page_t m_tmp;
+
+	vm_page_lock_assert(m_left, MA_OWNED);
+
+	/* all superpage belongs to the same vm_domain */
+	pq = &vm_phys_domain(m_left)->vmd_pagequeues[PQ_ACTIVE];
+	vm_pagequeue_lock(pq);
+	for(m_tmp = m_left; m_tmp < &m_left[npages]; m_tmp++)
+	{
+		/* validate this page */
+		m_tmp->valid = VM_PAGE_BITS_ALL;
+		/* most pages are not faulted so simply scan over all pages */
+		if (m_tmp->act_count < ACT_INIT)
+			m_tmp->act_count = ACT_INIT;
+		if (m_tmp->queue != PQ_NONE)
+			vm_page_dequeue(m_tmp);
+		// vm_page_enqueue(PQ_ACTIVE, m_tmp);
+		m_tmp->queue = PQ_ACTIVE;
+		TAILQ_INSERT_TAIL(&pq->pq_pl, m_tmp, plinks.q);
+		vm_pagequeue_cnt_inc(pq);
+	}
+	vm_pagequeue_unlock(pq);
 }
 
 /*
@@ -3722,6 +3878,7 @@ vm_page_is_valid(vm_page_t m, int base, int size)
 	return (m->valid != 0 && (m->valid & bits) == bits);
 }
 
+// int ps_fail[4] = {0};
 /*
  * Returns true if all of the specified predicates are true for the entire
  * (super)page and false otherwise.
@@ -3731,13 +3888,14 @@ vm_page_ps_test(vm_page_t m, int flags, vm_page_t skip_m)
 {
 	vm_object_t object;
 	int i, npages;
+	boolean_t skip_dirty;
 
 	object = m->object;
 	if (skip_m != NULL && skip_m->object != object)
 		return (false);
 	VM_OBJECT_ASSERT_LOCKED(object);
 	npages = atop(pagesizes[m->psind]);
-
+	skip_dirty = relax && (object->type == OBJT_DEFAULT && object->backing_object == NULL);
 	/*
 	 * The physically contiguous pages that make up a superpage, i.e., a
 	 * page with a page size index ("psind") greater than zero, will
@@ -3746,12 +3904,20 @@ vm_page_ps_test(vm_page_t m, int flags, vm_page_t skip_m)
 	for (i = 0; i < npages; i++) {
 		/* Always test object consistency, including "skip_m". */
 		if (m[i].object != object)
+		{
+			// ps_fail[0] ++;
+			// printf("ps_test: [%d %d %d %d]\n", ps_fail[0], ps_fail[1], ps_fail[2], ps_fail[3]);
 			return (false);
+		}
 		if (&m[i] == skip_m)
 			continue;
 		if ((flags & PS_NONE_BUSY) != 0 && vm_page_busied(&m[i]))
+		{
+			// ps_fail[1] ++;
+			// printf("ps_test: [%d %d %d %d]\n", ps_fail[0], ps_fail[1], ps_fail[2], ps_fail[3]);
 			return (false);
-		if ((flags & PS_ALL_DIRTY) != 0) {
+		}
+		if (!skip_dirty && (flags & PS_ALL_DIRTY) != 0) {
 			/*
 			 * Calling vm_page_test_dirty() or pmap_is_modified()
 			 * might stop this case from spuriously returning
@@ -3759,11 +3925,20 @@ vm_page_ps_test(vm_page_t m, int flags, vm_page_t skip_m)
 			 * on the object containing "m[i]".
 			 */
 			if (m[i].dirty != VM_PAGE_BITS_ALL)
+			{
+				// ps_fail[2] ++;
+				// printf("ps_test: [%d %d %d %d]\n", ps_fail[0], ps_fail[1], ps_fail[2], ps_fail[3]);
 				return (false);
+			}
 		}
 		if ((flags & PS_ALL_VALID) != 0 &&
 		    m[i].valid != VM_PAGE_BITS_ALL)
-			return (false);
+			{
+
+				// ps_fail[3] ++;
+				// printf("ps_test: [%d %d %d %d]\n", ps_fail[0], ps_fail[1], ps_fail[2], ps_fail[3]);
+				return (false);
+			}
 	}
 	return (true);
 }

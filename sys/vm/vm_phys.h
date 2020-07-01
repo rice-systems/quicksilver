@@ -74,6 +74,7 @@ vm_page_t vm_phys_alloc_contig(u_long npages, vm_paddr_t low, vm_paddr_t high,
     u_long alignment, vm_paddr_t boundary);
 vm_page_t vm_phys_alloc_freelist_pages(int freelist, int pool, int order);
 vm_page_t vm_phys_alloc_pages(int pool, int order);
+int vm_phys_count_order_9(void);
 boolean_t vm_phys_domain_intersects(long mask, vm_paddr_t low, vm_paddr_t high);
 int vm_phys_fictitious_reg_range(vm_paddr_t start, vm_paddr_t end,
     vm_memattr_t memattr);

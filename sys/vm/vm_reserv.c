@@ -61,6 +61,15 @@ __FBSDID("$FreeBSD$");
 #include <vm/vm_radix.h>
 #include <vm/vm_reserv.h>
 
+/* reserv idle daemon which zeros pages inside reservations */
+#include <opt_sched.h>
+#include <sys/proc.h>
+#include <sys/sched.h>
+#include <sys/kthread.h>
+#include <sys/unistd.h>
+
+
+
 /*
  * The reservation system supports the speculative allocation of large physical
  * pages ("superpages").  Speculative allocation enables the fully automatic
@@ -149,6 +158,29 @@ popmap_is_set(popmap_t popmap[], int i)
 }
 
 /*
+ * encode inpartpopq, need-to-migrate and marker status in inpartpopq
+ * TODO:
+ *	1. need an extra thread to migrate detected reservations and use
+ *  clear_migrate(x)
+ */
+#define RV_INPARTPOPQ		0x01
+#define RV_TRANSFERRED		0x02
+#define RV_NEEDMIGRATE 		0x04
+#define RV_MARKER			0x08
+#define RV_BADBOY			0x10
+// #define RV_SKIP				0x20
+#define clear_all(x)		(x = 0)
+#define is_inpartpopq(x)	(x & RV_INPARTPOPQ)
+#define clear_inpartpopq(x)	(x &= ~RV_INPARTPOPQ)
+#define set_inpartpopq(x)   (x |= RV_INPARTPOPQ)
+// #define is_skip(x)			(x & RV_SKIP)
+// #define set_skip(x)			(x |= RV_SKIP)
+// #define clear_skip(x)		(x &= ~RV_SKIP)
+#define settime(rv)			(rv->timestamp = ticks)
+#define need_migrate(x)		(x & RV_NEEDMIGRATE)
+#define clear_migrate(x)	(x &= ~RV_NEEDMIGRATE)
+#define set_migrate(x)		{x |= RV_NEEDMIGRATE;numofdeadbeef ++;}
+/*
  * The reservation structure
  *
  * A reservation structure is constructed whenever a large physical page is
@@ -169,9 +201,28 @@ struct vm_reserv {
 	vm_pindex_t	pindex;			/* offset within object */
 	vm_page_t	pages;			/* first page of a superpage */
 	int		popcnt;			/* # of pages in use */
+	int 	timestamp; 		/* timestamp last populated/depopulated */
 	char		inpartpopq;
 	popmap_t	popmap[NPOPMAP];	/* bit vector of used pages */
 };
+
+/* initialize the marker to help asyncpromo scan partpopq */
+struct vm_reserv async_marker, evict_marker, compact_marker;
+
+/* The marker initializer does not assign the memory */
+static void vm_reserv_init_marker(vm_reserv_t rv)
+{
+	bzero(rv, sizeof(*rv));
+	rv->object = NULL;
+	rv->inpartpopq = RV_INPARTPOPQ | RV_MARKER;
+	for(int i = 0; i < VM_LEVEL_0_NPAGES; i ++)
+		popmap_clear(rv->popmap, i);
+}
+/*
+ * [asyncpromo]
+ * TAILQ headname for struct vm_reserv
+ */
+TAILQ_HEAD(rvlist, vm_reserv);
 
 /*
  * The reservation array
@@ -210,6 +261,120 @@ static TAILQ_HEAD(, vm_reserv) vm_rvq_partpop =
 
 static SYSCTL_NODE(_vm, OID_AUTO, reserv, CTLFLAG_RD, 0, "Reservation Info");
 
+/* add statistics which counts how many pages are zeroed in reservation for
+ * early promotion at idle time
+ */
+static int async_prezero = 0, numofdeadbeef = 0, async_skipzero = 0;
+SYSCTL_INT(_vm_reserv, OID_AUTO, async_prezero, CTLFLAG_RD,
+    &async_prezero, 0, "Pages prezeroed for early promotion at idle time");
+SYSCTL_INT(_vm_reserv, OID_AUTO, async_skipzero, CTLFLAG_RD,
+    &async_skipzero, 0, "Pages skipped for zero in async promotion");
+// SYSCTL_INT(_vm_reserv, OID_AUTO, cnt_contention, CTLFLAG_RD,
+//     &cnt_contention, 0, "Pages compete for page faults");
+SYSCTL_INT(_vm_reserv, OID_AUTO, numofdeadbeef, CTLFLAG_RD,
+    &numofdeadbeef, 0, "reservations need to migrate");
+
+/* tunable parameters for asyncpromo */
+static int enable_prezero = 0;
+SYSCTL_INT(_vm_reserv, OID_AUTO, enable_prezero, CTLFLAG_RWTUN,
+    &enable_prezero, 0, "enable prezeroing pages in reservation");
+
+static int enable_compact = 0;
+SYSCTL_INT(_vm_reserv, OID_AUTO, enable_compact, CTLFLAG_RWTUN,
+    &enable_compact, 0, "enable evicting pages from inactive reservations");
+
+static int enable_sleep = 1;
+SYSCTL_INT(_vm_reserv, OID_AUTO, enable_sleep, CTLFLAG_RWTUN,
+    &enable_sleep, 0, "enable asyncpromo daemon to sleep");
+
+static int wakeup_frequency = 1;
+SYSCTL_INT(_vm_reserv, OID_AUTO, wakeup_frequency, CTLFLAG_RWTUN,
+    &wakeup_frequency, 0, "asyncpromo wakeup frequency");
+
+static int wakeup_time = 1;
+SYSCTL_INT(_vm_reserv, OID_AUTO, wakeup_time, CTLFLAG_RWTUN,
+    &wakeup_time, 0, "asyncpromo wakeup time");
+
+static int verbose = 0;
+SYSCTL_INT(_vm_reserv, OID_AUTO, verbose, CTLFLAG_RWTUN,
+    &verbose, 0, "asyncpromo verbose");
+
+static int pop_budget = 2;
+SYSCTL_INT(_vm_reserv, OID_AUTO, pop_budget, CTLFLAG_RWTUN,
+    &pop_budget, 0, "asyncpromo pre-population budget");
+
+/*
+ * The actual threshold is 64,
+ * because the 64th page fault will create a sp
+ */
+static int sync_popthreshold = 31;
+SYSCTL_INT(_vm_reserv, OID_AUTO, sync_popthreshold, CTLFLAG_RWTUN,
+    &sync_popthreshold, 0, "sync promotion pop threshold");
+
+static int pop_threshold = 63;
+SYSCTL_INT(_vm_reserv, OID_AUTO, pop_threshold, CTLFLAG_RWTUN,
+    &pop_threshold, 0, "asyncpromo pop-x threshold");
+
+static int zero_budget = 512;
+SYSCTL_INT(_vm_reserv, OID_AUTO, zero_budget, CTLFLAG_RWTUN,
+    &zero_budget, 0, "asyncpromo page zero budget");
+
+static int pop_succ = 0, pop_fail = 0, pop_broken = 0;
+SYSCTL_INT(_vm_reserv, OID_AUTO, pop_succ, CTLFLAG_RWTUN,
+    &pop_succ, 0, "asyncpromo pop succ");
+SYSCTL_INT(_vm_reserv, OID_AUTO, pop_fail, CTLFLAG_RWTUN,
+    &pop_fail, 0, "asyncpromo pop fail");
+SYSCTL_INT(_vm_reserv, OID_AUTO, pop_broken, CTLFLAG_RWTUN,
+    &pop_broken, 0, "asyncpromo pop broken");;
+
+
+#ifdef DEBUG_ASYNCPROMO
+/* debugging global variable and functions */
+vm_reserv_t rv_to_prepopulate = NULL;
+int rv_popidx_to_prepopulate = 0;
+
+vm_page_t vm_reserv_get_page(vm_reserv_t rv, int i)
+{
+	return &rv->pages[i];
+}
+
+int vm_reserv_get_popcnt(vm_reserv_t rv)
+{
+	return rv->popcnt;
+}
+
+int vm_reserv_get_popind(vm_reserv_t rv, int i)
+{
+	return (rv->popmap[i / NBPOPMAP] & (1UL << (i % NBPOPMAP)));
+}
+
+vm_object_t vm_reserv_get_object(vm_reserv_t rv)
+{
+	return rv->object;
+}
+
+vm_pindex_t vm_reserv_get_pindex(vm_reserv_t rv)
+{
+	return rv->pindex;
+}
+
+void vm_reserv_show_all_pindex_from_page(vm_page_t m)
+{
+
+	vm_reserv_t rv = &vm_reserv_array[VM_PAGE_TO_PHYS(m) >> VM_LEVEL_0_SHIFT];
+	for(int i = 0; i < VM_LEVEL_0_NPAGES; i ++)
+		if(popmap_is_set(rv->popmap, i))
+			printf("%lu ", rv->pages[i].pindex);
+	printf("\n");
+}
+
+int vm_reserv_get_popcnt_from_page(vm_page_t m)
+{
+	vm_reserv_t rv = &vm_reserv_array[VM_PAGE_TO_PHYS(m) >> VM_LEVEL_0_SHIFT];
+	return rv->popcnt;
+}
+#endif
+
 static long vm_reserv_broken;
 SYSCTL_LONG(_vm_reserv, OID_AUTO, broken, CTLFLAG_RD,
     &vm_reserv_broken, 0, "Cumulative number of broken reservations");
@@ -217,6 +382,11 @@ SYSCTL_LONG(_vm_reserv, OID_AUTO, broken, CTLFLAG_RD,
 static long vm_reserv_freed;
 SYSCTL_LONG(_vm_reserv, OID_AUTO, freed, CTLFLAG_RD,
     &vm_reserv_freed, 0, "Cumulative number of freed reservations");
+
+static int sysctl_vm_reserv_freesp(SYSCTL_HANDLER_ARGS);
+
+SYSCTL_PROC(_vm_reserv, OID_AUTO, freesp, CTLTYPE_INT | CTLFLAG_RD, NULL, 0,
+    sysctl_vm_reserv_freesp, "I", "Current number of available free reservations");
 
 static int sysctl_vm_reserv_fullpop(SYSCTL_HANDLER_ARGS);
 
@@ -227,6 +397,16 @@ static int sysctl_vm_reserv_partpopq(SYSCTL_HANDLER_ARGS);
 
 SYSCTL_OID(_vm_reserv, OID_AUTO, partpopq, CTLTYPE_STRING | CTLFLAG_RD, NULL, 0,
     sysctl_vm_reserv_partpopq, "A", "Partially populated reservation queues");
+
+static int sysctl_vm_reserv_popcdf(SYSCTL_HANDLER_ARGS);
+
+SYSCTL_OID(_vm_reserv, OID_AUTO, popcdf, CTLTYPE_STRING | CTLFLAG_RD, NULL, 0,
+    sysctl_vm_reserv_popcdf, "A", "Population CDF of existing reservations");
+
+static int sysctl_vm_reserv_need_migrate(SYSCTL_HANDLER_ARGS);
+
+SYSCTL_OID(_vm_reserv, OID_AUTO, need_migrate, CTLTYPE_STRING | CTLFLAG_RD, NULL, 0,
+    sysctl_vm_reserv_need_migrate, "A", "Reservations who need page migration");
 
 static long vm_reserv_reclaimed;
 SYSCTL_LONG(_vm_reserv, OID_AUTO, reclaimed, CTLFLAG_RD,
@@ -240,6 +420,15 @@ static boolean_t	vm_reserv_has_pindex(vm_reserv_t rv,
 static void		vm_reserv_populate(vm_reserv_t rv, int index);
 static void		vm_reserv_reclaim(vm_reserv_t rv);
 
+/*
+ * Returns the number of free physical superpages
+ */
+static int
+sysctl_vm_reserv_freesp(SYSCTL_HANDLER_ARGS)
+{
+	int freesp = vm_phys_count_order_9();
+	return (sysctl_handle_int(oidp, &freesp, 0, req));
+}
 /*
  * Returns the current number of full reservations.
  *
@@ -287,12 +476,105 @@ sysctl_vm_reserv_partpopq(SYSCTL_HANDLER_ARGS)
 		unused_pages = 0;
 		mtx_lock(&vm_page_queue_free_mtx);
 		TAILQ_FOREACH(rv, &vm_rvq_partpop/*[level]*/, partpopq) {
+			/* clean side effect of using async_marker */
+			if(rv->inpartpopq & RV_MARKER)
+				continue;
+
 			counter++;
 			unused_pages += VM_LEVEL_0_NPAGES - rv->popcnt;
 		}
 		mtx_unlock(&vm_page_queue_free_mtx);
 		sbuf_printf(&sbuf, "%5d: %6dK, %6d\n", level,
 		    unused_pages * ((int)PAGE_SIZE / 1024), counter);
+	}
+	error = sbuf_finish(&sbuf);
+	sbuf_delete(&sbuf);
+	return (error);
+}
+
+/*
+ * Describes the cdf of existing reservations
+ */
+static int
+sysctl_vm_reserv_popcdf(SYSCTL_HANDLER_ARGS)
+{
+	struct sbuf sbuf;
+	vm_reserv_t rv;
+	vm_paddr_t paddr;
+	struct vm_phys_seg *seg;
+	int fullpop, segind;
+	int error, level, i;
+	int cdf[513];
+
+	error = sysctl_wire_old_buffer(req, 0);
+	if (error != 0)
+		return (error);
+	sbuf_new_for_sysctl(&sbuf, NULL, 4096, req);
+	sbuf_printf(&sbuf, "\n");
+
+	for(i = 0; i < 512; i ++)
+		cdf[i] = 0;
+	for (level = -1; level <= VM_NRESERVLEVEL - 2; level++) {
+		mtx_lock(&vm_page_queue_free_mtx);
+		TAILQ_FOREACH(rv, &vm_rvq_partpop/*[level]*/, partpopq) {
+			/* clean side effect of using rv_marker */
+			if(rv->inpartpopq & RV_MARKER)
+				continue;
+			cdf[rv->popcnt] ++;
+		}
+		mtx_unlock(&vm_page_queue_free_mtx);
+		// sbuf_printf(&sbuf, "%5d: %6dK, %6d\n", level,
+		//     unused_pages * ((int)PAGE_SIZE / 1024), counter);
+	}
+
+
+	fullpop = 0;
+	for (segind = 0; segind < vm_phys_nsegs; segind++) {
+		seg = &vm_phys_segs[segind];
+		paddr = roundup2(seg->start, VM_LEVEL_0_SIZE);
+		while (paddr + VM_LEVEL_0_SIZE <= seg->end) {
+			rv = &vm_reserv_array[paddr >> VM_LEVEL_0_SHIFT];
+			fullpop += rv->popcnt == VM_LEVEL_0_NPAGES;
+			paddr += VM_LEVEL_0_SIZE;
+		}
+	}
+	cdf[512] = fullpop;
+	for(i = 1; i < 513; i ++)
+		sbuf_printf(&sbuf, "%d ", cdf[i]);
+	sbuf_printf(&sbuf, "\n");
+
+	error = sbuf_finish(&sbuf);
+	sbuf_delete(&sbuf);
+	return (error);
+}
+
+/*
+ * Describes the current state of the partially populated reservation queue.
+ */
+static int
+sysctl_vm_reserv_need_migrate(SYSCTL_HANDLER_ARGS)
+{
+	struct sbuf sbuf;
+	vm_reserv_t rv;
+	int counter, error, level;
+
+	error = sysctl_wire_old_buffer(req, 0);
+	if (error != 0)
+		return (error);
+	sbuf_new_for_sysctl(&sbuf, NULL, 128, req);
+	sbuf_printf(&sbuf, "\nLEVEL     NUMBER\n\n");
+	for (level = -1; level <= VM_NRESERVLEVEL - 2; level++) {
+		counter = 0;
+		mtx_lock(&vm_page_queue_free_mtx);
+		TAILQ_FOREACH(rv, &vm_rvq_partpop/*[level]*/, partpopq) {
+			/* clean side effect of using rv_marker */
+			if(rv->inpartpopq & RV_MARKER)
+				continue;
+			if(rv->inpartpopq & RV_NEEDMIGRATE)
+				counter++;
+		}
+		mtx_unlock(&vm_page_queue_free_mtx);
+		sbuf_printf(&sbuf, "%5d: %6d\n", level, counter);
 	}
 	error = sbuf_finish(&sbuf);
 	sbuf_delete(&sbuf);
@@ -319,9 +601,9 @@ vm_reserv_depopulate(vm_reserv_t rv, int index)
 	    index));
 	KASSERT(rv->popcnt > 0,
 	    ("vm_reserv_depopulate: reserv %p's popcnt is corrupted", rv));
-	if (rv->inpartpopq) {
+	if (is_inpartpopq(rv->inpartpopq)) {
 		TAILQ_REMOVE(&vm_rvq_partpop, rv, partpopq);
-		rv->inpartpopq = FALSE;
+		clear_inpartpopq(rv->inpartpopq);
 	} else {
 		KASSERT(rv->pages->psind == 1,
 		    ("vm_reserv_depopulate: reserv %p is already demoted",
@@ -332,11 +614,14 @@ vm_reserv_depopulate(vm_reserv_t rv, int index)
 	rv->popcnt--;
 	if (rv->popcnt == 0) {
 		LIST_REMOVE(rv, objq);
+		clear_all(rv->inpartpopq);
 		rv->object = NULL;
 		vm_phys_free_pages(rv->pages, VM_LEVEL_0_ORDER);
 		vm_reserv_freed++;
 	} else {
-		rv->inpartpopq = TRUE;
+		/* maybe prepopulation should skip badboy */
+		set_inpartpopq(rv->inpartpopq);
+		rv->timestamp = ticks;
 		TAILQ_INSERT_TAIL(&vm_rvq_partpop, rv, partpopq);
 	}
 }
@@ -362,6 +647,91 @@ vm_reserv_has_pindex(vm_reserv_t rv, vm_pindex_t pindex)
 	return (((pindex - rv->pindex) & ~(VM_LEVEL_0_NPAGES - 1)) == 0);
 }
 
+/* [syncpromo]
+	functions to help vm_fault syncronously promote superpages
+ */
+bool
+vm_reserv_satisfy_sync_promotion(vm_page_t m)
+{
+	vm_reserv_t rv = &vm_reserv_array[VM_PAGE_TO_PHYS(m) >> VM_LEVEL_0_SHIFT];
+	/* expect m to be installed in a reservation */
+	if(rv->object != NULL && rv->object == m->object
+		&& m->pindex >= rv->pindex
+		&& m->pindex < rv->pindex + VM_LEVEL_0_NPAGES
+		&& popmap_is_set(rv->popmap, m->pindex - rv->pindex)
+		&& rv->inpartpopq == RV_INPARTPOPQ
+		&& rv->popcnt >= sync_popthreshold)
+		return TRUE;
+	else
+		return FALSE;
+}
+
+bool
+vm_reserv_satisfy_adj_promotion(vm_page_t m)
+{
+	vm_reserv_t rv = &vm_reserv_array[VM_PAGE_TO_PHYS(m) >> VM_LEVEL_0_SHIFT];
+	/* expect m to be installed in a reservation */
+	if(rv->object != NULL && rv->object == m->object
+		&& m->pindex >= rv->pindex
+		&& m->pindex < rv->pindex + VM_LEVEL_0_NPAGES
+		&& popmap_is_set(rv->popmap, m->pindex - rv->pindex)
+		&& rv->inpartpopq == RV_INPARTPOPQ)
+		return TRUE;
+	else
+		return FALSE;
+}
+
+vm_pindex_t
+vm_reserv_pindex_from_page(vm_page_t m)
+{
+	return vm_reserv_array[VM_PAGE_TO_PHYS(m) >> VM_LEVEL_0_SHIFT].pindex;
+}
+
+void
+vm_reserv_copy_popmap_from_page(vm_page_t m, popmap_t *popmap)
+{
+	int i;
+	for(i = 0; i < NPOPMAP; i ++)
+		popmap[i] = vm_reserv_array[VM_PAGE_TO_PHYS(m) >> VM_LEVEL_0_SHIFT].popmap[i];
+}
+
+int
+vm_reserv_popmap_is_clear(vm_page_t m, int i)
+{
+	return popmap_is_clear(vm_reserv_array[VM_PAGE_TO_PHYS(m) >> VM_LEVEL_0_SHIFT].popmap, i);
+}
+
+int
+vm_reserv_get_next_set_index(vm_page_t m, int i)
+{
+	vm_reserv_t rv = &vm_reserv_array[VM_PAGE_TO_PHYS(m) >> VM_LEVEL_0_SHIFT];
+	while(popmap_is_clear(rv->popmap, i) && i < 512)
+		i ++;
+	return i;
+}
+
+int
+vm_reserv_get_next_clear_index(vm_page_t m, int i)
+{
+	vm_reserv_t rv = &vm_reserv_array[VM_PAGE_TO_PHYS(m) >> VM_LEVEL_0_SHIFT];
+	while(popmap_is_set(rv->popmap, i) && i < 512)
+		i ++;
+	return i;
+}
+
+void
+vm_reserv_mark_bad(vm_page_t m)
+{
+	vm_reserv_array[VM_PAGE_TO_PHYS(m) >> VM_LEVEL_0_SHIFT].inpartpopq |= RV_BADBOY;
+	return ;
+}
+
+bool
+vm_reserv_is_full(vm_page_t m)
+{
+	return (vm_reserv_array[VM_PAGE_TO_PHYS(m) >> VM_LEVEL_0_SHIFT].popcnt == VM_LEVEL_0_NPAGES);
+}
+
 /*
  * Increases the given reservation's population count.  Moves the reservation
  * to the tail of the partially populated reservation queue.
@@ -382,14 +752,15 @@ vm_reserv_populate(vm_reserv_t rv, int index)
 	    ("vm_reserv_populate: reserv %p is already full", rv));
 	KASSERT(rv->pages->psind == 0,
 	    ("vm_reserv_populate: reserv %p is already promoted", rv));
-	if (rv->inpartpopq) {
+	if (is_inpartpopq(rv->inpartpopq)) {
 		TAILQ_REMOVE(&vm_rvq_partpop, rv, partpopq);
-		rv->inpartpopq = FALSE;
+		clear_inpartpopq(rv->inpartpopq);
 	}
 	popmap_set(rv->popmap, index);
 	rv->popcnt++;
 	if (rv->popcnt < VM_LEVEL_0_NPAGES) {
-		rv->inpartpopq = TRUE;
+		set_inpartpopq(rv->inpartpopq);
+		rv->timestamp = ticks;
 		TAILQ_INSERT_TAIL(&vm_rvq_partpop, rv, partpopq);
 	} else
 		rv->pages->psind = 1;
@@ -559,7 +930,7 @@ vm_reserv_alloc_contig(vm_object_t object, vm_pindex_t pindex, u_long npages,
 		KASSERT(rv->popcnt == 0,
 		    ("vm_reserv_alloc_contig: reserv %p's popcnt is corrupted",
 		    rv));
-		KASSERT(!rv->inpartpopq,
+		KASSERT(!is_inpartpopq(rv->inpartpopq),
 		    ("vm_reserv_alloc_contig: reserv %p's inpartpopq is TRUE",
 		    rv));
 		for (i = 0; i < NPOPMAP; i++)
@@ -703,7 +1074,7 @@ vm_reserv_alloc_page(vm_object_t object, vm_pindex_t pindex, vm_page_t mpred)
 	rv->pindex = first;
 	KASSERT(rv->popcnt == 0,
 	    ("vm_reserv_alloc_page: reserv %p's popcnt is corrupted", rv));
-	KASSERT(!rv->inpartpopq,
+	KASSERT(!is_inpartpopq(rv->inpartpopq),
 	    ("vm_reserv_alloc_page: reserv %p's inpartpopq is TRUE", rv));
 	for (i = 0; i < NPOPMAP; i++)
 		KASSERT(rv->popmap[i] == 0,
@@ -742,7 +1113,7 @@ vm_reserv_break(vm_reserv_t rv)
 	mtx_assert(&vm_page_queue_free_mtx, MA_OWNED);
 	KASSERT(rv->object != NULL,
 	    ("vm_reserv_break: reserv %p is free", rv));
-	KASSERT(!rv->inpartpopq,
+	KASSERT(!is_inpartpopq(rv->inpartpopq),
 	    ("vm_reserv_break: reserv %p's inpartpopq is TRUE", rv));
 	LIST_REMOVE(rv, objq);
 	rv->object = NULL;
@@ -803,10 +1174,10 @@ vm_reserv_break_all(vm_object_t object)
 	while ((rv = LIST_FIRST(&object->rvq)) != NULL) {
 		KASSERT(rv->object == object,
 		    ("vm_reserv_break_all: reserv %p is corrupted", rv));
-		if (rv->inpartpopq) {
+		if (is_inpartpopq(rv->inpartpopq)) {
 			TAILQ_REMOVE(&vm_rvq_partpop, rv, partpopq);
-			rv->inpartpopq = FALSE;
 		}
+		clear_all(rv->inpartpopq);
 		vm_reserv_break(rv);
 	}
 	mtx_unlock(&vm_page_queue_free_mtx);
@@ -912,10 +1283,10 @@ vm_reserv_reclaim(vm_reserv_t rv)
 {
 
 	mtx_assert(&vm_page_queue_free_mtx, MA_OWNED);
-	KASSERT(rv->inpartpopq,
+	KASSERT(is_inpartpopq(rv->inpartpopq),
 	    ("vm_reserv_reclaim: reserv %p's inpartpopq is FALSE", rv));
 	TAILQ_REMOVE(&vm_rvq_partpop, rv, partpopq);
-	rv->inpartpopq = FALSE;
+	clear_all(rv->inpartpopq);
 	vm_reserv_break(rv);
 	vm_reserv_reclaimed++;
 }
@@ -933,7 +1304,10 @@ vm_reserv_reclaim_inactive(void)
 	vm_reserv_t rv;
 
 	mtx_assert(&vm_page_queue_free_mtx, MA_OWNED);
-	if ((rv = TAILQ_FIRST(&vm_rvq_partpop)) != NULL) {
+	rv = TAILQ_FIRST(&vm_rvq_partpop);
+	if(rv->inpartpopq & RV_MARKER)
+		rv = TAILQ_NEXT(rv, partpopq);
+	if (rv != NULL) {
 		vm_reserv_reclaim(rv);
 		return (TRUE);
 	}
@@ -961,6 +1335,10 @@ vm_reserv_reclaim_contig(u_long npages, vm_paddr_t low, vm_paddr_t high,
 		return (FALSE);
 	size = npages << PAGE_SHIFT;
 	TAILQ_FOREACH(rv, &vm_rvq_partpop, partpopq) {
+		/* clean side effect of using aync_marker */
+		if(rv->inpartpopq & RV_MARKER)
+			continue;
+
 		pa = VM_PAGE_TO_PHYS(&rv->pages[VM_LEVEL_0_NPAGES - 1]);
 		if (pa + PAGE_SIZE - size < low) {
 			/* This entire reservation is too low; go to next. */
@@ -1042,7 +1420,8 @@ void
 vm_reserv_rename(vm_page_t m, vm_object_t new_object, vm_object_t old_object,
     vm_pindex_t old_object_offset)
 {
-	vm_reserv_t rv;
+	vm_reserv_t rv, rv_tmp;
+	boolean_t merge;
 
 	VM_OBJECT_ASSERT_WLOCKED(new_object);
 	rv = vm_reserv_from_page(m);
@@ -1053,6 +1432,34 @@ vm_reserv_rename(vm_page_t m, vm_object_t new_object, vm_object_t old_object,
 			LIST_INSERT_HEAD(&new_object->rvq, rv, objq);
 			rv->object = new_object;
 			rv->pindex -= old_object_offset;
+
+			/*
+			 * [asyncpromo] Check pindex collision in &new_object->rvq
+			 * Not sure if it is worth, as vm_page_queue_free_mtx is locked
+			 */
+			merge = FALSE;
+			rv_tmp = LIST_NEXT(rv, objq);
+			if(rv_tmp != NULL)
+				/* scan the rest of objq from 2nd element, if size >= 2 */
+				LIST_FOREACH_FROM(rv_tmp, &new_object->rvq, objq)
+					if(rv_tmp->pindex == rv->pindex)
+					{
+						set_migrate(rv_tmp->inpartpopq);
+						merge = TRUE;
+					}
+			if(merge)
+				set_migrate(rv->inpartpopq);
+			// deadbeef_scan ++;
+
+			/*
+			 * [asyncpromo]
+			 * lazy mechanism:
+			 * mark the reservation as "transferred", instead of detecting
+			 * a pindex collision.
+			 * A transferred reservation has a small possibility to share
+			 * its pindex with another one in the
+			 */
+			// rv->inpartpopq |= RV_TRANSFERRED;
 		}
 		mtx_unlock(&vm_page_queue_free_mtx);
 	}
@@ -1122,5 +1529,596 @@ vm_reserv_to_superpage(vm_page_t m)
 	return (rv->object == m->object && rv->popcnt == VM_LEVEL_0_NPAGES ?
 	    rv->pages : NULL);
 }
+
+/*
+ * Below is the code for async_promote daemon
+ * The daemon should periodically scan partpopq to determine:
+ * a. A reservation should be promoted
+ * b. use temporal stores to zero reservations and promote as superpage
+ */
+
+// static int idlezero_enable_default = 0;
+/* Defer setting the enable flag until the kthread is running. */
+// static int idlezero_enable = 0;
+// SYSCTL_INT(_vm, OID_AUTO, idlezero_enable, CTLFLAG_RWTUN, &idlezero_enable, 0,
+//     "Allow the kernel to use idle cpu cycles to zero-out pages");
+/*
+ * Implement the asynchronous early-promotion mechanism.
+ */
+// static boolean_t wakeup_needed = FALSE;
+static int async_promote;
+
+/*
+ * Check if rv can never get fully populated.
+ * If a shadow object collapse, reservation could be renamed and merged into the private object,
+ * where there could be existing reservation sharing the same pindex
+ * The free page queue lock must be acquired, so do not use this function now
+ */
+#ifdef DEBUG_ASYNCPROMO
+boolean_t
+#else
+static boolean_t
+#endif
+vm_reserv_is_deadbeef(vm_reserv_t rv)
+{
+	vm_object_t obj;
+	vm_pindex_t pindex;
+	vm_reserv_t rvi;
+
+	// VM_OBJECT_ASSERT_RLOCKED(rv->object);
+
+	obj = rv->object;
+	pindex = rv->pindex;
+	LIST_FOREACH(rvi, &obj->rvq, objq)
+	{
+		if(rvi != rv && rvi->pindex == pindex)
+			return TRUE;
+	}
+	return FALSE;
+}
+
+/*
+ * This function pre-populate and zero all remaining free pages in a reservation
+ * Subsequent page fault will use pmap_enter to create a superpage directly
+ * This function does not necesssarily succeed. The free page queue lock is
+ * held only inside the vm_page_alloc when allocating a page from the reservation
+ * For performance, it is much better not to hold the free page queue lock,
+ * so, the vm_page_alloc may need to fail and detect if the reservation is broken,
+ * and we cannot assume the reservation's object is going to be valid all the time.
+ * The function would return whether prepopulate succeeds
+ * Caution: rv can be broken at any time without holding free page queue lock
+ * Return indicates whether the pre-population succeeds or not
+
+ * If rv exists then populate and zero all pages in the reservation
+ * This solution uses vm_page_alloc() to directly install all free pages
+ * and then zero all these busy pages and release their busy lock.
+ * After that, a cheap page fault on any page would promote this reservation as
+ * a superpage.
+ *
+ * Possible Optimization:
+ * Delete one page mapping to enforce a soft page fault to install a superpage
+ * mapping.
+ *
+ * Another solution:
+ * If you want to create all superpages, dig into all pmaps and install superpages
+*/
+static boolean_t
+vm_reserv_prepopulate(vm_reserv_t rv)
+{
+	int i;
+	vm_page_t m, mpred;
+	vm_object_t object;
+
+	mtx_assert(&vm_page_queue_free_mtx, MA_NOTOWNED);
+	/* [race] rv may be broken here */
+	if((object = rv->object) != NULL)
+		VM_OBJECT_WLOCK(object);
+	else
+	{
+		// printf("[prepopulate] FAIL: reservation gets broken\n");
+
+		// printf("[prepopulate] FAIL_1: succ|brok|fail|zero:[%d|%d|%d|%d]\n",
+		// 	pop_succ, pop_broken, pop_fail, async_prezero);
+		pop_broken ++;
+		return FALSE;
+	}
+
+#ifdef DEBUG_ASYNCPROMO
+	rv_to_prepopulate = rv;
+#endif
+
+	mpred = vm_page_find_most(object, rv->pindex + VM_LEVEL_0_NPAGES - 1);
+	/* maybe I should simply scan backwards
+	maintain a vm_page_t cursor which is the last page I added
+	with TAILQ_NEXT at the page to look at the pindex of the next page
+	if it is equal to the index I am trying to prepopulate
+	*/
+	for(i = VM_LEVEL_0_NPAGES - 1; i >= 0; i --)
+	{
+		/* rv can be broken here, because free page queue is not locked */
+		if(rv->object == NULL)
+			goto fail;
+
+		if(mpred != NULL && mpred->pindex == rv->pindex + i)
+		{
+			/* only examine consistency when mpred is reached, otherwise it is safe to prepopulate */
+			if(popmap_is_set(rv->popmap, i))
+			{
+				if(mpred == &rv->pages[i])
+					mpred = TAILQ_PREV(mpred, pglist, listq);
+				else
+					panic("%s: inconsistency found at pindex %lu: object holds 2 pages for the same pindex",
+					    __func__, rv->pindex + i);
+			}
+			else
+				/* mpred should have been populated inside the reservation. Let's abort now */
+				goto fail;
+		}
+		else
+		if(popmap_is_clear(rv->popmap, i))
+		{
+			/* prepopulate this page */
+#ifdef DEBUG_ASYNCPROMO
+			rv_popidx_to_prepopulate = i;
+#endif
+			/*
+			 * requires vm_page_alloc to allocate a free page from a reservation
+			 * The vm_page_alloc has been modified such that with VM_ALLOC_RESERVONLY,
+			 * it must fail if it cannot allocate a page from a reservation
+			 */
+
+			/* [potential bug]:
+				When swapping is triggered, reservations may be
+				broken and paged in again as free pages,
+				reservation may not be populated because of
+				fragmentation.
+				We currently ignore this bug by not working on any
+				benchmark requiring swapping
+			 */
+			// if(vm_page_lookup(object, rv->pindex + i))
+				/* such page exist, fail prepopulating this reservation */
+				// goto fail;
+			m = vm_page_alloc(object, rv->pindex + i,
+				VM_ALLOC_NORMAL | VM_ALLOC_ZERO | VM_ALLOC_RESERVONLY);
+			/*
+			 * TODO: get tail_next and double check and see if there is
+			 any inconsistency, track how many aborts there are */
+			/*
+			 * If the allocation fails, the reservation is already broken,
+			 * do not pre-zero it
+			 */
+			if(m == NULL)
+				goto fail;
+			/* release the object lock to do pre-zero */
+			VM_OBJECT_WUNLOCK(object);
+			/* check if page m is correctly allocated and xbusied */
+			vm_page_assert_xbusied(m);
+			/* m is xbusied after vm_page_alloc, so we can safely zero it */
+			if((m->flags & PG_ZERO) == 0)
+			{
+				/*
+				 * pages allocated in the reservation are not in freelist,
+				 * but acquiring free page queue list lock can prevent a page fault zeroing this page
+				 * So it is safe here to zero this page.
+				 * we cannot unlock the page queue lock to free the page, because it is not removed
+				 * from a reservation pool
+				 */
+				pmap_zero_page_idle(m);
+				m->flags |= PG_ZERO;
+				vm_page_zero_count ++;
+				async_prezero++;
+			}
+			else
+				async_skipzero ++;
+			/* lock the vm object again once page zeroing is done */
+			VM_OBJECT_WLOCK(object);
+
+			/* the lock contention optimization of vm_object could end up with a NULL
+			 * object that has been released when we zero the page.
+			 * only validate and enqueue the page if the object is still alive
+			 */
+			if(m->object != NULL && m->object == rv->object)
+			{
+				/* validate, explicitly dirty and unbusy this page (copied from vm_page_grab_pages) */
+				m->valid = VM_PAGE_BITS_ALL;
+				/* put it in the active queue */
+				vm_page_lock(m);
+				vm_page_activate(m);
+				vm_page_unlock(m);
+				vm_page_xunbusy(m);
+			}
+			else
+			{
+				// panic("%s: strange vm object detected",
+				//     __func__);
+				/* unbusy it anyway */
+				vm_page_xunbusy(m);
+				goto fail;
+			}
+
+		}
+		// else
+		// 	 do nothing, the page has just been faulted, you are in lock contention
+		// 	;
+	}
+
+	/*
+	 * The prepopulation succeeds
+	 * The reservation must get fully populated now
+	 */
+	VM_OBJECT_WUNLOCK(object);
+	if(verbose && ((pop_succ % 10) == 0))
+		printf("[prepopulate] succ|brok|fail|zero:[%d|%d|%d|%d]\n",
+			pop_succ, pop_broken, pop_fail, async_prezero);
+	// printf("[prepopulate] SUCC: %d pages allocated, %d pages zeroed, %d zeroed in total\n",
+	// 	already_zeroed + counter, counter, async_prezero);
+	// if(need_to_zero != already_zeroed + counter)
+	// {
+	// 	 The difference is from lock contention,
+	// 		page fault is competing for the pages
+
+	// 	cnt_contention += need_to_zero - already_zeroed - counter;
+	// }
+	pop_succ ++;
+	return TRUE;
+
+fail:
+	VM_OBJECT_WUNLOCK(object);
+	if(rv->object == NULL)
+	{
+		// printf("[prepopulate] FAIL: rv gets broken\n");
+		// printf("[prepopulate] FAIL_2: succ|brok|fail|zero:[%d|%d|%d|%d]\n",
+		// 	pop_succ, pop_broken, pop_fail, async_prezero);
+		pop_broken ++;
+	}
+	else
+	{
+		// printf("[prepopulate] FAIL: fails to alloc a page, rv is marked as badboy\n");
+		// printf("[prepopulate] FAIL_3: succ|brok|fail|zero:[%d|%d|%d|%d]\n",
+		// 	pop_succ, pop_broken, pop_fail, async_prezero);
+		// printf("[debug] OBJECT: flags[%x]\n", object->flags);
+		rv->inpartpopq |= RV_BADBOY;
+		pop_fail ++;
+	}
+	return FALSE;
+}
+
+/*
+ * scan partpopq of reservations for async promotion
+ * This function is serving for asyncpromo daemon, it is called
+ * with vm_page_queue_free_mtx locked
+ */
+static void
+vm_reserv_scan_partpopq(void)
+{
+	vm_reserv_t rv, prev;
+	vm_object_t obj;
+	int counter, eligible, pop_cnt;
+	boolean_t queue_locked;
+
+	/*  This code segment is hardcoded for 2MB superpages */
+	counter = eligible = pop_cnt = 0;
+
+	/*
+	 *  The traversal uses an async_marker to help locate the position in partpopq
+	 *  So that even though vm_page_queue_free_mtx is not always held,
+	 *  it is safe to keep traversing the TAILQ
+	 */
+	mtx_lock(&vm_page_queue_free_mtx);
+	// queue_locked = TRUE;
+	for (rv = TAILQ_LAST(&vm_rvq_partpop, rvlist);
+		 rv != NULL && pop_cnt < pop_budget;
+		 rv = prev) {
+		mtx_assert(&vm_page_queue_free_mtx, MA_OWNED);
+		/* there are async and compact markers */
+		if(rv->inpartpopq & RV_MARKER)
+			continue;
+		// prev = TAILQ_PREV(rv, rvlist, partpopq);
+		TAILQ_INSERT_BEFORE(rv, &async_marker, partpopq);
+		mtx_unlock(&vm_page_queue_free_mtx);
+		queue_locked = FALSE;
+
+		counter ++;
+		obj = rv->object;
+		/*
+		 * Find the reservation possible and eligible to be promoted.
+		 * A deadbeef reservation can never be promoted,
+		 * because there are other reservations
+		 * transferred to the same object with the same pindex.
+		 * None of them can be fully populated.
+		 */
+		if(obj != NULL && (obj->type == OBJT_DEFAULT || obj->type == OBJT_SWAP)
+			&& obj->backing_object == NULL // && obj->handle == NULL
+			&& rv->inpartpopq == RV_INPARTPOPQ //!vm_reserv_is_deadbeef(rv)
+			&& rv->popcnt >= pop_threshold)
+		{
+			// printf("[scan partpopq] going to prepopulate...\n");
+			/* rv will be removed from partpopq if gets prepopulated */
+			pop_cnt += vm_reserv_prepopulate(rv);
+		}
+
+		if (!queue_locked) {
+			mtx_lock(&vm_page_queue_free_mtx);
+			queue_locked = TRUE;
+		}
+		mtx_assert(&vm_page_queue_free_mtx, MA_OWNED);
+		prev = TAILQ_PREV(&async_marker, rvlist, partpopq);
+		TAILQ_REMOVE(&vm_rvq_partpop, &async_marker, partpopq);
+	}
+	mtx_unlock(&vm_page_queue_free_mtx);
+
+	// printf("[scan partpopq] scanned: %d, pre-populated: %d\n",
+	// 	counter, pop_cnt);
+	return ;
+}
+
+/* inactive reservation threshold is 10s, migration budget is 10MB/s */
+static int inactive_thre = 10000, migrate_budget = 10 * 256;
+
+SYSCTL_INT(_vm_reserv, OID_AUTO, inactive_thre, CTLFLAG_RWTUN,
+    &inactive_thre, 0, "inactive timeout threshold");
+SYSCTL_INT(_vm_reserv, OID_AUTO, migrate_budget, CTLFLAG_RWTUN,
+    &migrate_budget, 0, "memory compaction budget");
+
+static void
+vm_reserv_evict_inactive(void)
+{
+	int work, exit;
+	vm_reserv_t next, rv;
+	vm_object_t obj;
+
+	work = exit = 0;
+	// current_tick = ticks;
+	// printf("compaction start time: %d\n", current_tick);
+	/*
+	 *  The traversal uses evict_marker to help locate the position in partpopq
+	 *  So that even though vm_page_queue_free_mtx is not always held,
+	 *  it is safe to keep traversing the TAILQ
+	 */
+	mtx_lock(&vm_page_queue_free_mtx);
+	for (rv = TAILQ_FIRST(&vm_rvq_partpop);
+		 rv != NULL;
+		 rv = next)
+	{
+		mtx_assert(&vm_page_queue_free_mtx, MA_OWNED);
+		/* there are async and evict markers */
+		if(rv->inpartpopq & RV_MARKER)
+			continue;
+
+		TAILQ_INSERT_AFTER(&vm_rvq_partpop, rv, &evict_marker, partpopq);
+		mtx_unlock(&vm_page_queue_free_mtx);
+
+		// if(is_skip(rv->inpartpopq) != 0)
+		// 	goto skip;
+
+		// printf("rv timestamp %d, %x\n", rv->timestamp, rv->inpartpopq);
+		if(work < migrate_budget &&
+			(ticks - rv->timestamp > inactive_thre
+			|| need_migrate(rv->inpartpopq)))
+		{
+			obj = rv->object;
+			if(obj != NULL && (obj->flags & (OBJ_FICTITIOUS | OBJ_UNMANAGED)) == 0)
+			{
+				/* let's evict this reservation */
+				work += rv->popcnt;
+				vm_page_reclaim_run(VM_ALLOC_NORMAL, 512, rv->pages, 0);
+			}
+		}
+		else
+			/* optimization because the list is temporally ordered */
+			exit = 1;
+
+// skip:
+		mtx_lock(&vm_page_queue_free_mtx);
+		mtx_assert(&vm_page_queue_free_mtx, MA_OWNED);
+		next = TAILQ_NEXT(&evict_marker, partpopq);
+		TAILQ_REMOVE(&vm_rvq_partpop, &evict_marker, partpopq);
+		if(exit)
+			break;
+	}
+	mtx_unlock(&vm_page_queue_free_mtx);
+	return ;
+}
+
+/*
+ * TODO: A wakeup mechanism is required so that a page fault might
+   kick off asyncpromo
+ */
+static void
+vm_reserv_asyncpromo(void __unused *arg)
+{
+	vm_reserv_init_marker(&async_marker);
+	vm_reserv_init_marker(&evict_marker);
+
+	for (;;)
+	{
+		/* Are there reservations satisfying promotion condition ? */
+		if (enable_prezero)
+		{
+			vm_reserv_scan_partpopq();
+			/*
+			 * tsleep does not unlock any mutex lock
+			 * wakeup_frequency is tunable via sysctl, default = 0.1hz
+			 * hz ~= 1s
+			 */
+		}
+
+		/* evict inactive partpopq */
+		if (enable_compact)
+		{
+			vm_reserv_evict_inactive();
+		}
+
+		/* Try to sleep no matter if enable_prezero */
+		if(enable_sleep)
+		{
+			/* sleeps without holding any lock */
+			tsleep(&async_promote, 0,
+			    "asyncpromo", wakeup_frequency * hz / wakeup_time);
+		}
+	}
+}
+
+static void
+asyncpromo_start(void __unused *arg)
+{
+	int error;
+	struct proc *p;
+	struct thread *td;
+
+	error = kproc_create(vm_reserv_asyncpromo, NULL, &p, RFSTOPPED, 0,
+		"asyncpromo");
+	if (error)
+		panic("asyncpromo_start: error %d\n", error);
+	td = FIRST_THREAD_IN_PROC(p);
+	thread_lock(td);
+
+	/* We're an idle task, don't count us in the load. */
+	td->td_flags |= TDF_NOLOAD;
+	sched_class(td, PRI_IDLE);
+	sched_prio(td, PRI_MAX_IDLE);
+	sched_add(td, SRQ_BORING);
+	thread_unlock(td);
+}
+SYSINIT(asyncpromo, SI_SUB_KTHREAD_VM, SI_ORDER_ANY, asyncpromo_start, NULL);
+
+
+
+static int compact_method = 0;
+SYSCTL_INT(_vm_reserv, OID_AUTO, compact_method, CTLFLAG_RWTUN,
+    &compact_method, 0, "compaction method");
+
+static void
+vm_reserv_compact()
+{
+	vm_reserv_t rv, prev;
+	vm_object_t obj;
+	vm_page_t m_run;
+	vm_paddr_t high;
+	int available_order_9;
+
+	vm_reserv_init_marker(&compact_marker);
+
+	if(compact_method)
+		uprintf("\nset high to the end of each reservation\n");
+	else
+		uprintf("\nset high to 0\n");
+
+	available_order_9 = vm_phys_count_order_9();
+	uprintf("available order-9 pages before compaction:\n%d\n", available_order_9);
+	uprintf("2MB FMFI before compaction:\n%d / 100\n", 100 - 100 * available_order_9 * (1 << 9) / vm_cnt.v_free_count);
+	/*
+	 *  TODO: traverse the list forwards instead of backwards.
+	 */
+	mtx_lock(&vm_page_queue_free_mtx);
+	for (rv = TAILQ_LAST(&vm_rvq_partpop, rvlist);
+		 rv != NULL;
+		 rv = prev) {
+		mtx_assert(&vm_page_queue_free_mtx, MA_OWNED);
+		/* there are async and compact markers */
+		if(rv->inpartpopq & RV_MARKER)
+			continue;
+		// prev = TAILQ_PREV(rv, rvlist, partpopq);
+		TAILQ_INSERT_BEFORE(rv, &compact_marker, partpopq);
+		mtx_unlock(&vm_page_queue_free_mtx);
+
+		obj = rv->object;
+		if((obj->flags & (OBJ_FICTITIOUS | OBJ_UNMANAGED)) == 0)
+		{
+			/* let's reclaim this reservation */
+			m_run = rv->pages;
+			if(compact_method)
+				high = VM_PAGE_TO_PHYS(m_run) + NBPDR;
+			else
+				high = 0;
+
+			vm_page_reclaim_run(VM_ALLOC_NORMAL, 512, m_run, high);
+		}
+
+		mtx_lock(&vm_page_queue_free_mtx);
+		mtx_assert(&vm_page_queue_free_mtx, MA_OWNED);
+		prev = TAILQ_PREV(&compact_marker, rvlist, partpopq);
+		TAILQ_REMOVE(&vm_rvq_partpop, &compact_marker, partpopq);
+	}
+	mtx_unlock(&vm_page_queue_free_mtx);
+	available_order_9 = vm_phys_count_order_9();
+	uprintf("available order-9 pages before compaction:\n%d\n", available_order_9);
+	uprintf("2MB FMFI after compaction:\n%d / 100\n", 100 - 100 * available_order_9 * (1 << 9) / vm_cnt.v_free_count);
+}
+
+/*
+ * a debug sysctl to relocate all partial reservations
+ */
+static int
+debug_vm_reserv_compact(SYSCTL_HANDLER_ARGS)
+{
+	int error, i;
+
+	i = 0;
+	error = sysctl_handle_int(oidp, &i, 0, req);
+	if (error)
+		return (error);
+	if (i != 0)
+		vm_reserv_compact();
+	return (0);
+}
+
+SYSCTL_PROC(_vm_reserv, OID_AUTO, compact, CTLTYPE_INT | CTLFLAG_RW, 0, 0,
+    debug_vm_reserv_compact, "I", "compact all partial popq");
+
+
+static void
+vm_reserv_count_inactive()
+{
+	struct vm_domain *vmd;
+	vm_page_t m, next;
+	struct vm_pagequeue *pq;
+	int maxscan;
+
+	vmd = &vm_dom[0];
+	int clean_cnt = 0;
+
+	pq = &vmd->vmd_pagequeues[PQ_INACTIVE];
+	maxscan = pq->pq_cnt;
+	vm_pagequeue_lock(pq);
+	for (m = TAILQ_FIRST(&pq->pq_pl);
+	     m != NULL && maxscan-- > 0;
+	     m = next) {
+
+		next = TAILQ_NEXT(m, plinks.q);
+
+		/*
+		 * skip marker pages
+		 */
+		if (m->flags & PG_MARKER)
+			continue;
+
+		if (m->dirty != VM_PAGE_BITS_ALL && pmap_is_modified(m))
+			clean_cnt ++;
+	}
+	vm_pagequeue_unlock(pq);
+
+	uprintf("\nNumber of clean pages: %d\n", clean_cnt);
+}
+
+/*
+ * a debug sysctl to relocate all partial reservations
+ */
+static int
+debug_vm_reserv_count(SYSCTL_HANDLER_ARGS)
+{
+	int error, i;
+
+	i = 0;
+	error = sysctl_handle_int(oidp, &i, 0, req);
+	if (error)
+		return (error);
+	if (i != 0)
+		vm_reserv_count_inactive();
+	return (0);
+}
+
+SYSCTL_PROC(_vm_reserv, OID_AUTO, count, CTLTYPE_INT | CTLFLAG_RW, 0, 0,
+    debug_vm_reserv_count, "I", "count clean inactive pages");
 
 #endif	/* VM_NRESERVLEVEL > 0 */

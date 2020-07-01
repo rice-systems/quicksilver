@@ -96,6 +96,31 @@ ENTRY(sse2_pagezero)
         ret
 END(sse2_pagezero)
 
+
+/* va: rdi, pagesize: rsi */
+ENTRY(sse2_pagezero_chunk)
+        PUSH_FRAME_POINTER
+        addq    %rsi,%rdi
+        neg		%rsi
+        xorl    %eax,%eax
+        jmp     1f
+        /*
+         * The loop takes 29 bytes.  Ensure that it doesn`t cross a 32-byte
+         * cache line.
+         */
+        .p2align 5,0x90
+1:
+        movnti  %rax,(%rdi,%rsi)
+        movnti  %rax,8(%rdi,%rsi)
+        movnti  %rax,16(%rdi,%rsi)
+        movnti  %rax,24(%rdi,%rsi)
+        addq    $32,%rsi
+        jne     1b
+        sfence
+        POP_FRAME_POINTER
+        ret
+END(sse2_pagezero_chunk)
+
 ENTRY(bcmp)
 	PUSH_FRAME_POINTER
 	movq	%rdx,%rcx
@@ -267,16 +292,21 @@ ENTRY(copyout)
 	ja	copyout_fault
 
 	xchgq	%rdi,%rsi
-	/* bcopy(%rsi, %rdi, %rdx) */
 	movq	%rdx,%rcx
 
-	shrq	$3,%rcx
-	rep
-	movsq
-	movb	%dl,%cl
-	andb	$7,%cl
+	/* erms */
 	rep
 	movsb
+
+	/* bcopy(%rsi, %rdi, %rdx) */
+
+	# shrq	$3,%rcx
+	# rep
+	# movsq
+	# movb	%dl,%cl
+	# andb	$7,%cl
+	# rep
+	# movsb
 
 done_copyout:
 	xorl	%eax,%eax
@@ -317,14 +347,21 @@ ENTRY(copyin)
 
 	xchgq	%rdi,%rsi
 	movq	%rdx,%rcx
-	movb	%cl,%al
-	shrq	$3,%rcx				/* copy longword-wise */
-	rep
-	movsq
-	movb	%al,%cl
-	andb	$7,%cl				/* copy remaining bytes */
+
+	/* erms */
 	rep
 	movsb
+
+	# movb	%cl,%al
+	# shrq	$3,%rcx				/* copy longword-wise */
+	# rep
+	# movsq
+	# movb	%al,%cl
+	# andb	$7,%cl				/* copy remaining bytes */
+	# rep
+	# movsb
+
+
 
 done_copyin:
 	xorl	%eax,%eax

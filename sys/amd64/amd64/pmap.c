@@ -361,6 +361,12 @@ static int pg_ps_enabled = 1;
 SYSCTL_INT(_vm_pmap, OID_AUTO, pg_ps_enabled, CTLFLAG_RDTUN | CTLFLAG_NOFETCH,
     &pg_ps_enabled, 0, "Are large page mappings enabled?");
 
+// static int pmap_zero_cnt = 0, pmap_zero_idle_cnt = 0;
+// SYSCTL_INT(_vm_pmap, OID_AUTO, pmap_zero_cnt, CTLFLAG_RD,
+//     &pmap_zero_cnt, 0, "cnt of pmap_zero");
+// SYSCTL_INT(_vm_pmap, OID_AUTO, pmap_zero_idle_cnt, CTLFLAG_RD,
+//     &pmap_zero_idle_cnt, 0, "cnt of pmap_zero_idle");
+
 #define	PAT_INDEX_SIZE	8
 static int pat_index[PAT_INDEX_SIZE];	/* cache mode to PAT index conversion */
 
@@ -651,7 +657,7 @@ static void pmap_invalidate_pde_page(pmap_t pmap, vm_offset_t va,
 static void pmap_kenter_attr(vm_offset_t va, vm_paddr_t pa, int mode);
 static void pmap_pde_attr(pd_entry_t *pde, int cache_bits, int mask);
 #if VM_NRESERVLEVEL > 0
-static void pmap_promote_pde(pmap_t pmap, pd_entry_t *pde, vm_offset_t va,
+static int pmap_promote_pde(pmap_t pmap, pd_entry_t *pde, vm_offset_t va,
     struct rwlock **lockp);
 #endif
 static boolean_t pmap_protect_pde(pmap_t pmap, pd_entry_t *pde, vm_offset_t sva,
@@ -1347,6 +1353,22 @@ SYSCTL_ULONG(_vm_pmap_pde, OID_AUTO, mappings, CTLFLAG_RD,
 static u_long pmap_pde_p_failures;
 SYSCTL_ULONG(_vm_pmap_pde, OID_AUTO, p_failures, CTLFLAG_RD,
     &pmap_pde_p_failures, 0, "2MB page promotion failures");
+
+static u_long pmap_pde_p_failures_1;
+SYSCTL_ULONG(_vm_pmap_pde, OID_AUTO, p_failures_1, CTLFLAG_RD,
+    &pmap_pde_p_failures_1, 0, "2MB page promotion failures");
+
+static u_long pmap_pde_p_failures_2;
+SYSCTL_ULONG(_vm_pmap_pde, OID_AUTO, p_failures_2, CTLFLAG_RD,
+    &pmap_pde_p_failures_2, 0, "2MB page promotion failures");
+
+static u_long pmap_pde_p_failures_3;
+SYSCTL_ULONG(_vm_pmap_pde, OID_AUTO, p_failures_3, CTLFLAG_RD,
+    &pmap_pde_p_failures_3, 0, "2MB page promotion failures");
+
+static u_long pmap_pde_p_failures_4;
+SYSCTL_ULONG(_vm_pmap_pde, OID_AUTO, p_failures_4, CTLFLAG_RD,
+    &pmap_pde_p_failures_4, 0, "2MB page promotion failures");
 
 static u_long pmap_pde_promotions;
 SYSCTL_ULONG(_vm_pmap_pde, OID_AUTO, promotions, CTLFLAG_RD,
@@ -4519,17 +4541,17 @@ retry:
  * aligned, contiguous physical memory and (2) the 4KB page mappings must have
  * identical characteristics. 
  */
-static void
+static int
 pmap_promote_pde(pmap_t pmap, pd_entry_t *pde, vm_offset_t va,
     struct rwlock **lockp)
 {
 	pd_entry_t newpde;
 	pt_entry_t *firstpte, oldpte, pa, *pte;
-	pt_entry_t PG_G, PG_A, PG_M, PG_RW, PG_V;
+	pt_entry_t PG_G, PG_M, PG_RW, PG_V;
 	vm_page_t mpte;
 	int PG_PTE_CACHE;
 
-	PG_A = pmap_accessed_bit(pmap);
+	// PG_A = pmap_accessed_bit(pmap);
 	PG_G = pmap_global_bit(pmap);
 	PG_M = pmap_modified_bit(pmap);
 	PG_V = pmap_valid_bit(pmap);
@@ -4546,11 +4568,12 @@ pmap_promote_pde(pmap_t pmap, pd_entry_t *pde, vm_offset_t va,
 	firstpte = (pt_entry_t *)PHYS_TO_DMAP(*pde & PG_FRAME);
 setpde:
 	newpde = *firstpte;
-	if ((newpde & ((PG_FRAME & PDRMASK) | PG_A | PG_V)) != (PG_A | PG_V)) {
+	if ((newpde & ((PG_FRAME & PDRMASK) | PG_V)) != PG_V) {
 		atomic_add_long(&pmap_pde_p_failures, 1);
+		atomic_add_long(&pmap_pde_p_failures_1, 1);
 		CTR2(KTR_PMAP, "pmap_promote_pde: failure for va %#lx"
 		    " in pmap %p", va, pmap);
-		return;
+		return -1;
 	}
 	if ((newpde & (PG_M | PG_RW)) == PG_RW) {
 		/*
@@ -4567,15 +4590,16 @@ setpde:
 	 * PTE maps an unexpected 4KB physical page or does not have identical
 	 * characteristics to the first PTE.
 	 */
-	pa = (newpde & (PG_PS_FRAME | PG_A | PG_V)) + NBPDR - PAGE_SIZE;
+	pa = (newpde & (PG_PS_FRAME | PG_V)) + NBPDR - PAGE_SIZE;
 	for (pte = firstpte + NPTEPG - 1; pte > firstpte; pte--) {
 setpte:
 		oldpte = *pte;
-		if ((oldpte & (PG_FRAME | PG_A | PG_V)) != pa) {
+		if ((oldpte & (PG_FRAME | PG_V)) != pa) {
 			atomic_add_long(&pmap_pde_p_failures, 1);
+			atomic_add_long(&pmap_pde_p_failures_2, 1);
 			CTR2(KTR_PMAP, "pmap_promote_pde: failure for va %#lx"
 			    " in pmap %p", va, pmap);
-			return;
+			return -1;
 		}
 		if ((oldpte & (PG_M | PG_RW)) == PG_RW) {
 			/*
@@ -4591,9 +4615,11 @@ setpte:
 		}
 		if ((oldpte & PG_PTE_PROMOTE) != (newpde & PG_PTE_PROMOTE)) {
 			atomic_add_long(&pmap_pde_p_failures, 1);
+			atomic_add_long(&pmap_pde_p_failures_3, 1);
 			CTR2(KTR_PMAP, "pmap_promote_pde: failure for va %#lx"
 			    " in pmap %p", va, pmap);
-			return;
+			// printf("fail 3: old|%lx new|%lx\n", oldpte, newpde);
+			return -1;
 		}
 		pa -= PAGE_SIZE;
 	}
@@ -4611,10 +4637,11 @@ setpte:
 	    ("pmap_promote_pde: page table page's pindex is wrong"));
 	if (pmap_insert_pt_page(pmap, mpte)) {
 		atomic_add_long(&pmap_pde_p_failures, 1);
+		atomic_add_long(&pmap_pde_p_failures_4, 1);
 		CTR2(KTR_PMAP,
 		    "pmap_promote_pde: failure for va %#lx in pmap %p", va,
 		    pmap);
-		return;
+		return -1;
 	}
 
 	/*
@@ -4639,6 +4666,8 @@ setpte:
 	atomic_add_long(&pmap_pde_promotions, 1);
 	CTR2(KTR_PMAP, "pmap_promote_pde: success for va %#lx"
 	    " in pmap %p", va, pmap);
+
+	return 0;
 }
 #endif /* VM_NRESERVLEVEL > 0 */
 
@@ -5115,6 +5144,7 @@ pmap_enter_quick_locked(pmap_t pmap, vm_offset_t va, vm_page_t m,
 	struct spglist free;
 	pt_entry_t *pte, PG_V;
 	vm_paddr_t pa;
+	int rv;
 
 	KASSERT(va < kmi.clean_sva || va >= kmi.clean_eva ||
 	    (m->oflags & VPO_UNMANAGED) != 0,
@@ -5215,6 +5245,23 @@ pmap_enter_quick_locked(pmap_t pmap, vm_offset_t va, vm_page_t m,
 		pte_store(pte, pa | PG_V | PG_U);
 	else
 		pte_store(pte, pa | PG_V | PG_U | PG_MANAGED);
+
+
+
+#if VM_NRESERVLEVEL > 0
+	/*
+	 * If both the page table page and the reservation are fully
+	 * populated, then attempt promotion.
+	 */
+	if ((mpte == NULL || mpte->wire_count == NPTEPG) &&
+	    pmap_ps_enabled(pmap) &&
+	    (m->flags & PG_FICTITIOUS) == 0 &&
+	    vm_reserv_level_iffullpop(m) == 0) {
+		rv = pmap_promote_pde(pmap, pmap_pde(pmap, va), va, lockp);
+		// printf("va: %lx, rv: %d, type: %d\n", va, rv, m->object->type);
+	}
+#endif
+
 	return (mpte);
 }
 
@@ -5596,6 +5643,7 @@ void
 pmap_zero_page(vm_page_t m)
 {
 	vm_offset_t va = PHYS_TO_DMAP(VM_PAGE_TO_PHYS(m));
+	// pmap_zero_cnt ++;
 
 	pagezero((void *)va);
 }
@@ -5622,13 +5670,44 @@ pmap_zero_page_area(vm_page_t m, int off, int size)
  *	the page into KVM and using bzero to clear its contents.  This
  *	is intended to be called from the vm_pagezero process only and
  *	outside of Giant.
+ *  [sync_promo]:
+ *		modified to zero page with no cache effect
  */
 void
 pmap_zero_page_idle(vm_page_t m)
 {
 	vm_offset_t va = PHYS_TO_DMAP(VM_PAGE_TO_PHYS(m));
+	// pmap_zero_idle_cnt ++;
+	sse2_pagezero((void *)va);
+}
 
-	pagezero((void *)va);
+/*
+ *	pmap_zero_page_area_idle zeros the specified hardware page by mapping
+ *	the page into KVM and using sse2_pagezero to clear its contents.
+ *
+ *	off and size may not cover an area beyond a single hardware page.
+ */
+void
+pmap_zero_pages_idle(vm_page_t m, int npages)
+{
+	vm_offset_t va = PHYS_TO_DMAP(VM_PAGE_TO_PHYS(m));
+	/*
+		[fast page zeroing]
+		npages is supposed to be <= 512
+		one should always use this code to zero chunks of data
+		on graphchi(pagerank_3):
+			sse2_pagezero_chunk:
+				79.02 real       235.97 user        26.04 sys
+			sse2_pagezero:
+				80.04 real       240.45 user        27.29 sys
+	*/
+	sse2_pagezero_chunk((void *)va, npages << 12);
+	// while(npages > 0)
+	// {
+	// 	sse2_pagezero((void *)va);
+	// 	va += PAGE_SIZE;
+	// 	npages --;
+	// }
 }
 
 /*
@@ -6577,11 +6656,25 @@ pmap_advise(pmap_t pmap, vm_offset_t sva, vm_offset_t eva, int advice)
 			 * table page is fully populated, this removal never
 			 * frees a page table page.
 			 */
+			// if ((oldpde & PG_W) == 0) {
+			// 	pte = pmap_pde_to_pte(pde, sva);
+			// 	KASSERT((*pte & PG_V) != 0,
+			// 	    ("pmap_advise: invalid PTE"));
+			// 	pmap_remove_pte(pmap, pte, sva, *pde, NULL,
+			// 	    &lock);
+			// 	anychanged = TRUE;
+			// }
+			/* patch for MADV_FREE from svn 350191 */
 			if ((oldpde & PG_W) == 0) {
-				pte = pmap_pde_to_pte(pde, sva);
+				va = va_next;
+				if (va > eva)
+					va = eva;
+				va -= PAGE_SIZE;
+				KASSERT(va >= sva, ("pmap_advise: xxx"));
+				pte = pmap_pde_to_pte(pde, va);
 				KASSERT((*pte & PG_V) != 0,
 				    ("pmap_advise: invalid PTE"));
-				pmap_remove_pte(pmap, pte, sva, *pde, NULL,
+				pmap_remove_pte(pmap, pte, va, *pde, NULL,
 				    &lock);
 				anychanged = TRUE;
 			}
