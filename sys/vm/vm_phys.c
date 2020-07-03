@@ -1535,14 +1535,6 @@ vm_phys_prezero_all(void)
 			if(m_first == NULL)
 				m_first = m;
 
-			/* the freelist queue of order has been fully scanned */
-			// if((m->flags & PG_ZERO) != 0)
-			// {
-			// 	vm_phys_free_pages(m, order);
-			// 	break;
-			// }
-
-
 			for (m_tmp = m; m_tmp < &m[1 << order]; m_tmp++)
 			{
 				if ((m_tmp->flags & PG_ZERO) == 0)
@@ -1551,11 +1543,6 @@ vm_phys_prezero_all(void)
 					m_tmp->flags |= PG_ZERO;
 					vm_page_zero_count++;
 					cnt_prezero++;
-				}
-				else
-				{
-					/* It is fine, skip and do nothing */
-					// panic("zero pages in contiguous pre-zero");
 				}
 			}
 

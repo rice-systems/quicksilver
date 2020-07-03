@@ -346,8 +346,6 @@ vm_fault_soft_fast(struct faultstate *fs, vm_offset_t vaddr, vm_prot_t prot,
 			if ((flags & PS_ALL_DIRTY) != 0)
 				fault_type |= VM_PROT_WRITE;
 		}
-		// if(psind == 0 && m_super->psind == 1)
-		// 	pmap_pde_p_failures_5 ++;
 	}
 #endif
 	rv = pmap_enter(fs->map->pmap, vaddr, m_map, prot, fault_type |
@@ -563,7 +561,7 @@ vm_fault_hold(vm_map_t map, vm_offset_t vaddr, vm_prot_t fault_type,
 	struct faultstate fs;
 	struct vnode *vp;
 	vm_object_t next_object, retry_object;
-	vm_page_t m_ret, m_super; //, m_tmp;
+	vm_page_t m_ret, m_super;
 	vm_paddr_t rv_pa, rv_pa_end;
 	vm_offset_t e_end, e_start;
 	vm_pindex_t retry_pindex, rv_pindex;
@@ -1346,8 +1344,13 @@ readrest:
 			if(m_ret != NULL)
 			{
 				/* call sse2_pagezero next_i-i times, no PG_ZERO should be considered */
+
+				/* non-temporal bulk zeroing */
 				// pmap_zero_pages_idle(m_ret, i - 1 - leftdist);
+
+				/* temporal bulk zeroing. Using this obtains similar non-temporal perf on E3, but could be slower on E5 */
 				pmap_zero_page_area(m_ret, 0, (i - 1 - leftdist) << 12);
+
 				sync_prezero += i - 1 - leftdist;
 
 				/* pagers are hot in cache, validate and activate them */
@@ -1370,8 +1373,13 @@ readrest:
 			if(m_ret != NULL)
 			{
 				/* call sse2_pagezero next_i-i times, no PG_ZERO should be considered */
+
+				/* non-temporal bulk zeroing */
 				// pmap_zero_pages_idle(m_ret, rightdist - 1 - i);
+
+				/* temporal bulk zeroing. Using this obtains similar non-temporal perf on E3, but could be slower on E5 */
 				pmap_zero_page_area(m_ret, 0, (rightdist - 1 - i) << 12);
+
 				sync_prezero += rightdist - 1 - i;
 
 				/* pages are hot in cache, validate and activate them */
@@ -1392,32 +1400,6 @@ readrest:
 	    vm_reserv_satisfy_sync_promotion(fs.m))
 	{
 		rv_pindex = vm_reserv_pindex_from_page(fs.m);
-
-		/* alloc page by page */
-		// for(i = 0; i < 512; i ++)
-		// 	if(vm_reserv_popmap_is_clear(fs.m, i))
-		// 	{
-		// 		m_sync = vm_page_alloc(fs.object, rv_pindex + i,
-		// 			VM_ALLOC_NORMAL | VM_ALLOC_RESERVONLY | VM_ALLOC_ZERO);
-		// 		if(m_sync == NULL)
-		// 		{
-		// 			/* stop doing sync populating */
-		// 			goto syncpromo_failed;
-		// 		}
-		// 		else
-		// 		{
-		// 			if((m_sync->flags & PG_ZERO) == 0)
-		// 			{
-		// 				sync_prezero ++;
-		// 				pmap_zero_page_idle(m_sync);
-		// 				m_sync->flags &= PG_ZERO;
-		// 			}
-		// 			else
-		// 				sync_skipzero ++;
-		// 			m_sync->valid = VM_PAGE_BITS_ALL;
-		// 			vm_page_xunbusy(m_sync);
-		// 		}
-		// 	}
 
 		/* alloc segment by segment */
 		vm_reserv_copy_popmap_from_page(fs.m, popmap);
@@ -1453,8 +1435,6 @@ readrest:
 
 					/* pages are hot in cache, validate and activate them */
 					vm_page_activate_and_validate_pages(m_ret, next_i - i);
-					// for(m_tmp = m_ret; m_tmp < &m_ret[next_i - i]; m_tmp ++)
-					// 	m_tmp->valid = VM_PAGE_BITS_ALL;
 				}
 				else
 					/* abort if allocation failed */
@@ -1462,55 +1442,6 @@ readrest:
 			}
 			i = next_i;
 		}
-		// uprintf("finished allocation\n");
-
-		// i = vm_reserv_get_next_clear_index(fs.m, 0);
-		// rv_pa = VM_PAGE_TO_PHYS(fs.m) - ((fs.pindex - rv_pindex) << PAGE_SHIFT);
-		// rv_pa_end = rv_pa + NBPDR;
-
-		// while(i < 512)
-		// {
-		// 	next_i = vm_reserv_get_next_set_index(fs.m, i);
-		// 	m_ret = vm_page_alloc_contig(fs.object, rv_pindex + i,
-		// 		VM_ALLOC_NORMAL | VM_ALLOC_RESERVONLY | VM_ALLOC_ZERO,
-		// 		next_i - i,
-		// 		rv_pa, rv_pa_end,
-		// 		PAGE_SIZE, NBPDR, VM_MEMATTR_DEFAULT);
-
-		// 	if(m_ret != NULL)
-		// 	{
-		// 		/* call sse2_pagezero next_i-i times, no PG_ZERO should be considered */
-		// 		pmap_zero_pages_idle(m_ret, next_i - i);
-		// 		sync_prezero += next_i - i;
-
-		// 		/* scan pages in order to skip */
-		// 		for(m_sync = m_ret; m_sync < &m_ret[next_i - i]; m_sync ++)
-		// 		{
-		// 			 try not to affect the cache because this is not the
-		// 			 * faulted page
-
-		// 			// if((m_sync->flags & PG_ZERO) == 0)
-		// 			// {
-		// 			// 	sync_prezero ++;
-		// 			// 	pmap_zero_page_idle(m_sync);
-		// 			// 	// m_sync->flags &= PG_ZERO;
-		// 			// }
-		// 			// else
-		// 			// 	sync_skipzero ++;
-
-		// 			m_sync->valid = VM_PAGE_BITS_ALL;
-		// 			/* put it in the active queue */
-		// 			vm_page_lock(m_sync);
-		// 			vm_page_activate(m_sync);
-		// 			vm_page_unlock(m_sync);
-		// 			vm_page_xunbusy(m_sync);
-		// 		}
-		// 		i = vm_reserv_get_next_clear_index(fs.m, next_i);
-		// 	}
-		// 	else
-		// 		/* abort if allocation failed */
-		// 		goto syncpromo_failed;
-		// }
 
 		if(i == 512)
 		{
@@ -1558,37 +1489,7 @@ readrest:
 syncpromo_failed:
 			vm_reserv_mark_bad(fs.m);
 			sync_fail ++;
-			// uprintf("fail allocation %d - %d\n", i, next_i);
 		}
-
-		/* activate all allocated pages:
-		 * m_super[0] -> m_super[next_i]
-		 * m_super might be NULL because the allocation could fail
-		 */
-		// next_i = i;
-
-		// m_super = fs.m - (fs.pindex - rv_pindex);
-		// if(m_super != NULL)
-		// {
-			/* pages m_super -- m_super + 512 are all locked */
-			// vm_page_lock(m_super);
-			// uprintf("going to activate\n");
-			// for(i = 0; i < next_i; i ++)
-			// 	if((popmap[i / popmap_nbits] &
-			// 		(1UL << (i % popmap_nbits))) == 0)
-			// 	{
-					/* port code from vm_page_xunbusy_locked */
-					// atomic_store_rel_int(&m_super[i].busy_lock, VPB_UNBUSIED);
-					// wakeup(&m_super[i]);
-				// 	m_super[i].valid = VM_PAGE_BITS_ALL;
-				// }
-			// vm_page_activate_super(m_super, fs.m);
-			// uprintf("finished activation\n");
-			/* validate all pre-allocated pages, fs.m will be skipped */
-			// uprintf("finished xunbusy\n");
-			// vm_page_unlock(m_super);
-		// }
-		// uprintf("Done with all allocation stuff\n");
 	}
 #endif
 

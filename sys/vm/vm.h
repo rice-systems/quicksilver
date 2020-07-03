@@ -154,23 +154,6 @@ void swap_release(vm_ooffset_t decr);
 void swap_release_by_cred(vm_ooffset_t decr, struct ucred *cred);
 void swapper(void);
 
-#ifdef DEBUG_ASYNCPROMO
-extern int last_request;
-/* global function to check if a reservation has pindex collisions */
-// extern boolean_t vm_reserv_is_deadbeef(vm_reserv_t rv);
-
-/* debugging global variable */
-extern vm_reserv_t rv_to_prepopulate;
-extern int rv_popidx_to_prepopulate;
-
-extern vm_page_t vm_reserv_get_page(vm_reserv_t rv, int i);
-extern int vm_reserv_get_popind(vm_reserv_t rv, int i);
-extern int vm_reserv_get_popcnt(vm_reserv_t rv);
-extern vm_object_t vm_reserv_get_object(vm_reserv_t rv);
-extern vm_pindex_t vm_reserv_get_pindex(vm_reserv_t rv);
-extern void vm_reserv_show_all_pindex_from_page(vm_page_t m);
-extern int vm_reserv_get_popcnt_from_page(vm_page_t m);
-#endif
 
 #endif				/* VM_H */
 

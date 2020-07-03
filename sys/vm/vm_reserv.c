@@ -168,14 +168,10 @@ popmap_is_set(popmap_t popmap[], int i)
 #define RV_NEEDMIGRATE 		0x04
 #define RV_MARKER			0x08
 #define RV_BADBOY			0x10
-// #define RV_SKIP				0x20
 #define clear_all(x)		(x = 0)
 #define is_inpartpopq(x)	(x & RV_INPARTPOPQ)
 #define clear_inpartpopq(x)	(x &= ~RV_INPARTPOPQ)
 #define set_inpartpopq(x)   (x |= RV_INPARTPOPQ)
-// #define is_skip(x)			(x & RV_SKIP)
-// #define set_skip(x)			(x |= RV_SKIP)
-// #define clear_skip(x)		(x &= ~RV_SKIP)
 #define settime(rv)			(rv->timestamp = ticks)
 #define need_migrate(x)		(x & RV_NEEDMIGRATE)
 #define clear_migrate(x)	(x &= ~RV_NEEDMIGRATE)
@@ -269,8 +265,6 @@ SYSCTL_INT(_vm_reserv, OID_AUTO, async_prezero, CTLFLAG_RD,
     &async_prezero, 0, "Pages prezeroed for early promotion at idle time");
 SYSCTL_INT(_vm_reserv, OID_AUTO, async_skipzero, CTLFLAG_RD,
     &async_skipzero, 0, "Pages skipped for zero in async promotion");
-// SYSCTL_INT(_vm_reserv, OID_AUTO, cnt_contention, CTLFLAG_RD,
-//     &cnt_contention, 0, "Pages compete for page faults");
 SYSCTL_INT(_vm_reserv, OID_AUTO, numofdeadbeef, CTLFLAG_RD,
     &numofdeadbeef, 0, "reservations need to migrate");
 
@@ -327,53 +321,6 @@ SYSCTL_INT(_vm_reserv, OID_AUTO, pop_fail, CTLFLAG_RWTUN,
 SYSCTL_INT(_vm_reserv, OID_AUTO, pop_broken, CTLFLAG_RWTUN,
     &pop_broken, 0, "asyncpromo pop broken");;
 
-
-#ifdef DEBUG_ASYNCPROMO
-/* debugging global variable and functions */
-vm_reserv_t rv_to_prepopulate = NULL;
-int rv_popidx_to_prepopulate = 0;
-
-vm_page_t vm_reserv_get_page(vm_reserv_t rv, int i)
-{
-	return &rv->pages[i];
-}
-
-int vm_reserv_get_popcnt(vm_reserv_t rv)
-{
-	return rv->popcnt;
-}
-
-int vm_reserv_get_popind(vm_reserv_t rv, int i)
-{
-	return (rv->popmap[i / NBPOPMAP] & (1UL << (i % NBPOPMAP)));
-}
-
-vm_object_t vm_reserv_get_object(vm_reserv_t rv)
-{
-	return rv->object;
-}
-
-vm_pindex_t vm_reserv_get_pindex(vm_reserv_t rv)
-{
-	return rv->pindex;
-}
-
-void vm_reserv_show_all_pindex_from_page(vm_page_t m)
-{
-
-	vm_reserv_t rv = &vm_reserv_array[VM_PAGE_TO_PHYS(m) >> VM_LEVEL_0_SHIFT];
-	for(int i = 0; i < VM_LEVEL_0_NPAGES; i ++)
-		if(popmap_is_set(rv->popmap, i))
-			printf("%lu ", rv->pages[i].pindex);
-	printf("\n");
-}
-
-int vm_reserv_get_popcnt_from_page(vm_page_t m)
-{
-	vm_reserv_t rv = &vm_reserv_array[VM_PAGE_TO_PHYS(m) >> VM_LEVEL_0_SHIFT];
-	return rv->popcnt;
-}
-#endif
 
 static long vm_reserv_broken;
 SYSCTL_LONG(_vm_reserv, OID_AUTO, broken, CTLFLAG_RD,
@@ -523,8 +470,6 @@ sysctl_vm_reserv_popcdf(SYSCTL_HANDLER_ARGS)
 			cdf[rv->popcnt] ++;
 		}
 		mtx_unlock(&vm_page_queue_free_mtx);
-		// sbuf_printf(&sbuf, "%5d: %6dK, %6d\n", level,
-		//     unused_pages * ((int)PAGE_SIZE / 1024), counter);
 	}
 
 
@@ -1449,17 +1394,6 @@ vm_reserv_rename(vm_page_t m, vm_object_t new_object, vm_object_t old_object,
 					}
 			if(merge)
 				set_migrate(rv->inpartpopq);
-			// deadbeef_scan ++;
-
-			/*
-			 * [asyncpromo]
-			 * lazy mechanism:
-			 * mark the reservation as "transferred", instead of detecting
-			 * a pindex collision.
-			 * A transferred reservation has a small possibility to share
-			 * its pindex with another one in the
-			 */
-			// rv->inpartpopq |= RV_TRANSFERRED;
 		}
 		mtx_unlock(&vm_page_queue_free_mtx);
 	}
@@ -1533,19 +1467,11 @@ vm_reserv_to_superpage(vm_page_t m)
 /*
  * Below is the code for async_promote daemon
  * The daemon should periodically scan partpopq to determine:
- * a. A reservation should be promoted
- * b. use temporal stores to zero reservations and promote as superpage
  */
 
-// static int idlezero_enable_default = 0;
-/* Defer setting the enable flag until the kthread is running. */
-// static int idlezero_enable = 0;
-// SYSCTL_INT(_vm, OID_AUTO, idlezero_enable, CTLFLAG_RWTUN, &idlezero_enable, 0,
-//     "Allow the kernel to use idle cpu cycles to zero-out pages");
 /*
  * Implement the asynchronous early-promotion mechanism.
  */
-// static boolean_t wakeup_needed = FALSE;
 static int async_promote;
 
 /*
@@ -1554,18 +1480,12 @@ static int async_promote;
  * where there could be existing reservation sharing the same pindex
  * The free page queue lock must be acquired, so do not use this function now
  */
-#ifdef DEBUG_ASYNCPROMO
-boolean_t
-#else
 static boolean_t
-#endif
 vm_reserv_is_deadbeef(vm_reserv_t rv)
 {
 	vm_object_t obj;
 	vm_pindex_t pindex;
 	vm_reserv_t rvi;
-
-	// VM_OBJECT_ASSERT_RLOCKED(rv->object);
 
 	obj = rv->object;
 	pindex = rv->pindex;
@@ -1599,9 +1519,7 @@ vm_reserv_is_deadbeef(vm_reserv_t rv)
  * Delete one page mapping to enforce a soft page fault to install a superpage
  * mapping.
  *
- * Another solution:
- * If you want to create all superpages, dig into all pmaps and install superpages
-*/
+ */
 static boolean_t
 vm_reserv_prepopulate(vm_reserv_t rv)
 {
@@ -1615,24 +1533,17 @@ vm_reserv_prepopulate(vm_reserv_t rv)
 		VM_OBJECT_WLOCK(object);
 	else
 	{
-		// printf("[prepopulate] FAIL: reservation gets broken\n");
-
-		// printf("[prepopulate] FAIL_1: succ|brok|fail|zero:[%d|%d|%d|%d]\n",
-		// 	pop_succ, pop_broken, pop_fail, async_prezero);
 		pop_broken ++;
 		return FALSE;
 	}
 
-#ifdef DEBUG_ASYNCPROMO
-	rv_to_prepopulate = rv;
-#endif
-
 	mpred = vm_page_find_most(object, rv->pindex + VM_LEVEL_0_NPAGES - 1);
-	/* maybe I should simply scan backwards
-	maintain a vm_page_t cursor which is the last page I added
-	with TAILQ_NEXT at the page to look at the pindex of the next page
-	if it is equal to the index I am trying to prepopulate
-	*/
+	/* 
+	 * scan backwards
+	 * maintain a vm_page_t cursor which is the last page I added
+	 * with TAILQ_NEXT at the page to look at the pindex of the next page
+	 * if it is equal to the index I am trying to prepopulate
+	 */
 	for(i = VM_LEVEL_0_NPAGES - 1; i >= 0; i --)
 	{
 		/* rv can be broken here, because free page queue is not locked */
@@ -1658,31 +1569,15 @@ vm_reserv_prepopulate(vm_reserv_t rv)
 		if(popmap_is_clear(rv->popmap, i))
 		{
 			/* prepopulate this page */
-#ifdef DEBUG_ASYNCPROMO
-			rv_popidx_to_prepopulate = i;
-#endif
 			/*
 			 * requires vm_page_alloc to allocate a free page from a reservation
 			 * The vm_page_alloc has been modified such that with VM_ALLOC_RESERVONLY,
 			 * it must fail if it cannot allocate a page from a reservation
+			 * If the reservation was broken by swapping, prepopulation will fail correctly
 			 */
-
-			/* [potential bug]:
-				When swapping is triggered, reservations may be
-				broken and paged in again as free pages,
-				reservation may not be populated because of
-				fragmentation.
-				We currently ignore this bug by not working on any
-				benchmark requiring swapping
-			 */
-			// if(vm_page_lookup(object, rv->pindex + i))
-				/* such page exist, fail prepopulating this reservation */
-				// goto fail;
 			m = vm_page_alloc(object, rv->pindex + i,
 				VM_ALLOC_NORMAL | VM_ALLOC_ZERO | VM_ALLOC_RESERVONLY);
-			/*
-			 * TODO: get tail_next and double check and see if there is
-			 any inconsistency, track how many aborts there are */
+
 			/*
 			 * If the allocation fails, the reservation is already broken,
 			 * do not pre-zero it
@@ -1729,17 +1624,12 @@ vm_reserv_prepopulate(vm_reserv_t rv)
 			}
 			else
 			{
-				// panic("%s: strange vm object detected",
-				//     __func__);
 				/* unbusy it anyway */
 				vm_page_xunbusy(m);
 				goto fail;
 			}
 
 		}
-		// else
-		// 	 do nothing, the page has just been faulted, you are in lock contention
-		// 	;
 	}
 
 	/*
@@ -1750,33 +1640,15 @@ vm_reserv_prepopulate(vm_reserv_t rv)
 	if(verbose && ((pop_succ % 10) == 0))
 		printf("[prepopulate] succ|brok|fail|zero:[%d|%d|%d|%d]\n",
 			pop_succ, pop_broken, pop_fail, async_prezero);
-	// printf("[prepopulate] SUCC: %d pages allocated, %d pages zeroed, %d zeroed in total\n",
-	// 	already_zeroed + counter, counter, async_prezero);
-	// if(need_to_zero != already_zeroed + counter)
-	// {
-	// 	 The difference is from lock contention,
-	// 		page fault is competing for the pages
-
-	// 	cnt_contention += need_to_zero - already_zeroed - counter;
-	// }
 	pop_succ ++;
 	return TRUE;
 
 fail:
 	VM_OBJECT_WUNLOCK(object);
 	if(rv->object == NULL)
-	{
-		// printf("[prepopulate] FAIL: rv gets broken\n");
-		// printf("[prepopulate] FAIL_2: succ|brok|fail|zero:[%d|%d|%d|%d]\n",
-		// 	pop_succ, pop_broken, pop_fail, async_prezero);
 		pop_broken ++;
-	}
 	else
 	{
-		// printf("[prepopulate] FAIL: fails to alloc a page, rv is marked as badboy\n");
-		// printf("[prepopulate] FAIL_3: succ|brok|fail|zero:[%d|%d|%d|%d]\n",
-		// 	pop_succ, pop_broken, pop_fail, async_prezero);
-		// printf("[debug] OBJECT: flags[%x]\n", object->flags);
 		rv->inpartpopq |= RV_BADBOY;
 		pop_fail ++;
 	}
@@ -1805,7 +1677,6 @@ vm_reserv_scan_partpopq(void)
 	 *  it is safe to keep traversing the TAILQ
 	 */
 	mtx_lock(&vm_page_queue_free_mtx);
-	// queue_locked = TRUE;
 	for (rv = TAILQ_LAST(&vm_rvq_partpop, rvlist);
 		 rv != NULL && pop_cnt < pop_budget;
 		 rv = prev) {
@@ -1813,7 +1684,6 @@ vm_reserv_scan_partpopq(void)
 		/* there are async and compact markers */
 		if(rv->inpartpopq & RV_MARKER)
 			continue;
-		// prev = TAILQ_PREV(rv, rvlist, partpopq);
 		TAILQ_INSERT_BEFORE(rv, &async_marker, partpopq);
 		mtx_unlock(&vm_page_queue_free_mtx);
 		queue_locked = FALSE;
@@ -1828,11 +1698,10 @@ vm_reserv_scan_partpopq(void)
 		 * None of them can be fully populated.
 		 */
 		if(obj != NULL && (obj->type == OBJT_DEFAULT || obj->type == OBJT_SWAP)
-			&& obj->backing_object == NULL // && obj->handle == NULL
-			&& rv->inpartpopq == RV_INPARTPOPQ //!vm_reserv_is_deadbeef(rv)
+			&& obj->backing_object == NULL
+			&& rv->inpartpopq == RV_INPARTPOPQ
 			&& rv->popcnt >= pop_threshold)
 		{
-			// printf("[scan partpopq] going to prepopulate...\n");
 			/* rv will be removed from partpopq if gets prepopulated */
 			pop_cnt += vm_reserv_prepopulate(rv);
 		}
@@ -1847,12 +1716,10 @@ vm_reserv_scan_partpopq(void)
 	}
 	mtx_unlock(&vm_page_queue_free_mtx);
 
-	// printf("[scan partpopq] scanned: %d, pre-populated: %d\n",
-	// 	counter, pop_cnt);
 	return ;
 }
 
-/* inactive reservation threshold is 10s, migration budget is 10MB/s */
+/* inactive reservation threshold is 10s, default migration budget is 10MB/s */
 static int inactive_thre = 10000, migrate_budget = 10 * 256;
 
 SYSCTL_INT(_vm_reserv, OID_AUTO, inactive_thre, CTLFLAG_RWTUN,
@@ -1868,8 +1735,6 @@ vm_reserv_evict_inactive(void)
 	vm_object_t obj;
 
 	work = exit = 0;
-	// current_tick = ticks;
-	// printf("compaction start time: %d\n", current_tick);
 	/*
 	 *  The traversal uses evict_marker to help locate the position in partpopq
 	 *  So that even though vm_page_queue_free_mtx is not always held,
@@ -1888,10 +1753,6 @@ vm_reserv_evict_inactive(void)
 		TAILQ_INSERT_AFTER(&vm_rvq_partpop, rv, &evict_marker, partpopq);
 		mtx_unlock(&vm_page_queue_free_mtx);
 
-		// if(is_skip(rv->inpartpopq) != 0)
-		// 	goto skip;
-
-		// printf("rv timestamp %d, %x\n", rv->timestamp, rv->inpartpopq);
 		if(work < migrate_budget &&
 			(ticks - rv->timestamp > inactive_thre
 			|| need_migrate(rv->inpartpopq)))
@@ -1908,7 +1769,6 @@ vm_reserv_evict_inactive(void)
 			/* optimization because the list is temporally ordered */
 			exit = 1;
 
-// skip:
 		mtx_lock(&vm_page_queue_free_mtx);
 		mtx_assert(&vm_page_queue_free_mtx, MA_OWNED);
 		next = TAILQ_NEXT(&evict_marker, partpopq);
@@ -2018,7 +1878,6 @@ vm_reserv_compact()
 		/* there are async and compact markers */
 		if(rv->inpartpopq & RV_MARKER)
 			continue;
-		// prev = TAILQ_PREV(rv, rvlist, partpopq);
 		TAILQ_INSERT_BEFORE(rv, &compact_marker, partpopq);
 		mtx_unlock(&vm_page_queue_free_mtx);
 
@@ -2042,8 +1901,6 @@ vm_reserv_compact()
 	}
 	mtx_unlock(&vm_page_queue_free_mtx);
 	available_order_9 = vm_phys_count_order_9();
-	uprintf("available order-9 pages before compaction:\n%d\n", available_order_9);
-	uprintf("2MB FMFI after compaction:\n%d / 100\n", 100 - 100 * available_order_9 * (1 << 9) / vm_cnt.v_free_count);
 }
 
 /*
