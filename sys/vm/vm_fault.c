@@ -1346,10 +1346,10 @@ readrest:
 				/* call sse2_pagezero next_i-i times, no PG_ZERO should be considered */
 
 				/* non-temporal bulk zeroing */
-				// pmap_zero_pages_idle(m_ret, i - 1 - leftdist);
+				pmap_zero_pages_idle(m_ret, i - 1 - leftdist);
 
 				/* temporal bulk zeroing. Using this obtains similar non-temporal perf on E3, but could be slower on E5 */
-				pmap_zero_page_area(m_ret, 0, (i - 1 - leftdist) << 12);
+				// pmap_zero_page_area(m_ret, 0, (i - 1 - leftdist) << 12);
 
 				sync_prezero += i - 1 - leftdist;
 
@@ -1375,10 +1375,10 @@ readrest:
 				/* call sse2_pagezero next_i-i times, no PG_ZERO should be considered */
 
 				/* non-temporal bulk zeroing */
-				// pmap_zero_pages_idle(m_ret, rightdist - 1 - i);
+				pmap_zero_pages_idle(m_ret, rightdist - 1 - i);
 
 				/* temporal bulk zeroing. Using this obtains similar non-temporal perf on E3, but could be slower on E5 */
-				pmap_zero_page_area(m_ret, 0, (rightdist - 1 - i) << 12);
+				// pmap_zero_page_area(m_ret, 0, (rightdist - 1 - i) << 12);
 
 				sync_prezero += rightdist - 1 - i;
 
