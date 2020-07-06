@@ -1,0 +1,90 @@
+diff --git a/Documentation/mic/mpssd/Makefile b/Documentation/mic/mpssd/Makefile
+index 06871b0c..5b206e66 100644
+--- a/Documentation/mic/mpssd/Makefile
++++ b/Documentation/mic/mpssd/Makefile
+@@ -1,4 +1,4 @@
+-ifndef CROSS_COMPILE
++ifdef CROSS_COMPILE
+ # List of programs to build
+ hostprogs-$(CONFIG_X86_64) := mpssd
+ 
+diff --git a/Makefile b/Makefile
+index d5b37391..66709516 100644
+--- a/Makefile
++++ b/Makefile
+@@ -295,8 +295,8 @@ CONFIG_SHELL := $(shell if [ -x "$$BASH" ]; then echo $$BASH; \
+ 	  else if [ -x /bin/bash ]; then echo /bin/bash; \
+ 	  else echo sh; fi ; fi)
+ 
+-HOSTCC       = gcc
+-HOSTCXX      = g++
++HOSTCC       = gcc-4.9
++HOSTCXX      = g++-4.9
+ HOSTCFLAGS   = -Wall -Wmissing-prototypes -Wstrict-prototypes -O2 -fomit-frame-pointer -std=gnu89
+ HOSTCXXFLAGS = -O2
+ 
+@@ -780,9 +780,9 @@ include scripts/Makefile.extrawarn
+ 
+ # Add any arch overrides and user supplied CPPFLAGS, AFLAGS and CFLAGS as the
+ # last assignments
+-KBUILD_CPPFLAGS += $(ARCH_CPPFLAGS) $(KCPPFLAGS)
+-KBUILD_AFLAGS   += $(ARCH_AFLAGS)   $(KAFLAGS)
+-KBUILD_CFLAGS   += $(ARCH_CFLAGS)   $(KCFLAGS)
++KBUILD_CPPFLAGS += $(ARCH_CPPFLAGS) $(KCPPFLAGS) -fno-pie -Wno-pointer-sign
++KBUILD_AFLAGS   += $(ARCH_AFLAGS)   $(KAFLAGS) -fno-pie -Wno-pointer-sign
++KBUILD_CFLAGS   += $(ARCH_CFLAGS)   $(KCFLAGS) -fno-pie -Wno-pointer-sign
+ 
+ # Use --build-id when available.
+ LDFLAGS_BUILD_ID = $(patsubst -Wl$(comma)%,%,\
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index bc07bf2b..57a5e17b 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -503,7 +503,7 @@ static ssize_t promotion_metric_store(struct kobject *kobj,
+ 	int err;
+ 
+ 	err = kstrtoul(buf, 10, &metric);
+-	if (err || metric < 0 || metric > 2)
++	if (err || metric < 0 || metric > 3)
+ 		return -EINVAL;
+ 
+ 	khugepaged_promotion_metric = metric;
+@@ -977,11 +977,14 @@ int do_huge_pmd_anonymous_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		}
+ 		return ret;
+ 	}
+-#if 0
+-	gfp = alloc_hugepage_gfpmask(transparent_hugepage_defrag(vma), 0);
+-	page = alloc_hugepage_vma(gfp, vma, haddr, HPAGE_PMD_ORDER);
+-#endif
+-	page = NULL;
++
++	if(khugepaged_promotion_metric == 3)
++	{
++		gfp = alloc_hugepage_gfpmask(transparent_hugepage_defrag(vma), 0);
++		page = alloc_hugepage_vma(gfp, vma, haddr, HPAGE_PMD_ORDER);
++	}
++	else
++		page = NULL;
+ 	if (unlikely(!page)) {
+ 		count_vm_event(THP_FAULT_FALLBACK);
+ 		return VM_FAULT_FALLBACK;
+@@ -1306,11 +1309,13 @@ int do_huge_pmd_wp_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ alloc:
+ 	if (transparent_hugepage_enabled(vma) &&
+ 	    !transparent_hugepage_debug_cow()) {
+-#if 0
+-		huge_gfp = alloc_hugepage_gfpmask(transparent_hugepage_defrag(vma), 0);
+-		new_page = alloc_hugepage_vma(huge_gfp, vma, haddr, HPAGE_PMD_ORDER);
+-#endif
+-		new_page = NULL;
++		if(khugepaged_promotion_metric == 3)
++		{
++			huge_gfp = alloc_hugepage_gfpmask(transparent_hugepage_defrag(vma), 0);
++			new_page = alloc_hugepage_vma(huge_gfp, vma, haddr, HPAGE_PMD_ORDER);
++		}
++		else
++			new_page = NULL;
+ 	} else
+ 		new_page = NULL;
+ 
