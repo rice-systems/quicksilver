@@ -273,7 +273,7 @@ static int enable_prezero = 0;
 SYSCTL_INT(_vm_reserv, OID_AUTO, enable_prezero, CTLFLAG_RWTUN,
     &enable_prezero, 0, "enable prezeroing pages in reservation");
 
-static int enable_compact = 0;
+static int enable_compact = 1;
 SYSCTL_INT(_vm_reserv, OID_AUTO, enable_compact, CTLFLAG_RWTUN,
     &enable_compact, 0, "enable evicting pages from inactive reservations");
 
@@ -293,15 +293,14 @@ static int verbose = 0;
 SYSCTL_INT(_vm_reserv, OID_AUTO, verbose, CTLFLAG_RWTUN,
     &verbose, 0, "asyncpromo verbose");
 
-static int pop_budget = 2;
+static int pop_budget = 0;
 SYSCTL_INT(_vm_reserv, OID_AUTO, pop_budget, CTLFLAG_RWTUN,
     &pop_budget, 0, "asyncpromo pre-population budget");
 
 /*
- * The actual threshold is 64,
- * because the 64th page fault will create a sp
+ * Use sync-64 as default threshold
  */
-static int sync_popthreshold = 31;
+static int sync_popthreshold = 64;
 SYSCTL_INT(_vm_reserv, OID_AUTO, sync_popthreshold, CTLFLAG_RWTUN,
     &sync_popthreshold, 0, "sync promotion pop threshold");
 
@@ -1719,8 +1718,8 @@ vm_reserv_scan_partpopq(void)
 	return ;
 }
 
-/* inactive reservation threshold is 10s, default migration budget is 10MB/s */
-static int inactive_thre = 10000, migrate_budget = 10 * 256;
+/* inactive reservation threshold is 5s, default migration budget is 1GB/s */
+static int inactive_thre = 5000, migrate_budget = 262144;
 
 SYSCTL_INT(_vm_reserv, OID_AUTO, inactive_thre, CTLFLAG_RWTUN,
     &inactive_thre, 0, "inactive timeout threshold");

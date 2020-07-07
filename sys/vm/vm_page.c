@@ -145,7 +145,7 @@ static int pa_tryrelock_restart;
 SYSCTL_INT(_vm, OID_AUTO, tryrelock_restart, CTLFLAG_RD,
     &pa_tryrelock_restart, 0, "Number of tryrelock restarts");
 
-static int relax = 0;
+static int relax = 1;
 SYSCTL_INT(_vm, OID_AUTO, relax, CTLFLAG_RWTUN,
     &relax, 0, "relax vm_page_ps_test");
 

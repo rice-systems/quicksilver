@@ -144,7 +144,7 @@ static int adjdist = 4;
 SYSCTL_INT(_vm, OID_AUTO, adjdist, CTLFLAG_RWTUN,
     &adjdist, 0, "adjacent promo distance");
 
-static int enable_syncpromo = 0;
+static int enable_syncpromo = 1;
 SYSCTL_INT(_vm, OID_AUTO, enable_syncpromo, CTLFLAG_RWTUN,
     &enable_syncpromo, 0, "enable sync promotion");
 
