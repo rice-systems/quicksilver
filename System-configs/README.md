@@ -25,6 +25,23 @@ Configurations of systems evaluated in our ATC paper
 - linux-frag.sh: The fragmentation script to fragment memory in Linux
 - drop.sh: The script to drop all file caches in Linux
 
+
+## freebsd
+
+- emulate-linux.sh: The script to enable Linux emulation in FreeBSD
+- freebsd-frag.sh: The fragmentation script to fragment memory in FreeBSD
+- drop.sh: The script to drop all file caches in FreeBSD
+
+
+## quicksilver
+
+- emulate-linux.sh: The script to enable Linux emulation in FreeBSD
+- sync-0-compact.sh: The script to enable Sync-0 settings
+- sync-64-compact.sh: The script to enable Sync-64 settings
+- async-64-compact.sh: The script to enable Async-64 settings
+- async-256-compact.sh: The script to enable Async-256 settings
+
 ## bench-script
 
-- bench.sh: An example of benchmark script for Linux. 
+- bench-linux.sh: An example of benchmark script for Linux-based systems. 
+- bench-sync-0.sh: An example of benchmark script for FreeBSD-based systems. 

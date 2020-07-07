@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # For freebsd
-~/boot/linux.sh
+~/boot/emulate-linux.sh
 CLEAN=~/boot/drop.sh
 FRAG=~/boot/freebsd-frag.sh
 POLICY=~/boot/sync-0-compact.sh
