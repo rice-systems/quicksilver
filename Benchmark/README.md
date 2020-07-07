@@ -10,6 +10,7 @@ In FreeBSD, the same Linux binaries are profiled.
 
 gcc flags:
 ```-std=c99 -m64 -static -O3 -march=skylake -ffast-math -fopenmp -fno-strict-aliasing -fgnu89-inline```
+
 g++ flags:
 ```-std=c++03 -m64  -static -O3 -march=skylake -ffast-math -fopenmp```
 
