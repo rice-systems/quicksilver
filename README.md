@@ -37,7 +37,3 @@ Install FreeBSD kernel image first: [FreeBSD-11.2-RELEASE-amd64-memstick.img](ht
 - Proactive memory defragmentation
 	- Scan a partially populated reservation list every second
 	- Reclaim inactive physical superpages by evicting individual 4KB pages
-
-## Benchmarks
-
-To be finished.
