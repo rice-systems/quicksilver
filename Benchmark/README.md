@@ -6,6 +6,13 @@ Detailed settings and descriptions of benchmarks used in our ATC paper:
 Benchmarks are all compiled (except for GraphChi-PR and Redis) in Linux with additonal ```-static``` compiler option.
 In FreeBSD, the same Linux binaries are profiled.
 
+## How to emulate on FreeBSD
+
+https://www.freebsd.org/doc/handbook/linuxemu-lbc-install.html
+
+In FreeBSD, you can run Linux binaries by emulating Linux's system calls. To link binaries
+with the same libaries, compile benchmarks with ```-static``` to avoid using dynamic libraries.
+
 ## SPEC-CPU 2017
 
 gcc flags:
@@ -68,7 +75,14 @@ g++ flags:
 ## ANN
 
 - annoy: https://github.com/spotify/annoy (commit 8c5930)
-	- Code in ./ann are based on annoy
+	- Code in ```cd ./ann``` are based on annoy
 	- Compile with ```make```
 	- Build a random hash table with ```./build.x```
 	- Perf random queries: ```./query.x```
+
+## Redis
+
+- redis 4.0.14
+	- Compile with ```make MALLOC=jemalloc```
+	- Benchmark redis server with memtier on a client machine connected with a 40Gbps NIC
+	- Scripts and redis server configs are in ./redis folder
