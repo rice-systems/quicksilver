@@ -7,13 +7,12 @@ Details are in our ATC paper:
 [A comprehensive analysis of superpage mechanisms and policies](https://www.usenix.org/conference/atc20/presentation/zhu-weixi)
 
 ## Branches
-- r11.2: Original FreeBSD release 11.2 code. Patched with pmc counters for Intel Kabylake CPUs.
-- quicksilver: Quicksilver source code
+- r11.2: FreeBSD 11.2 appeared in the paper. Patched with pmc counters for Intel Kabylake CPUs and selective jemalloc patches for better Redis performance.
+- quicksilver: Quicksilver source code, based on the FreeBSD 11.2 appeared in the paper.
 - master: Documents, scripts and benchmarks
 
 ## Components
 
-- Quicksilver.diff: The patch of quicksilver starting from FreeBSD release 11.2
 - System-configs: Configurations of systems evaluated in our ATC paper
 - Benchmark: benchmarks used in our ATC paper
 - Frag: fragmentation program to replicate our memory fragmentation situation (Frag-50 and Frag-100)
